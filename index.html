@@ -1,0 +1,1269 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="description" content="Universal subtitle pipeline — transcribe, translate & remux any video — drop videos, double-click, walk away">
+<meta name="theme-color" content="#121214">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Subs Pipeline — Transcribe → Translate → Remux Setup Guide v6</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --bg-base: #121214;
+  --bg-surface: #1C1C1E;
+  --bg-elevated: #2C2C2E;
+  --bg-hover: #3A3A3C;
+  --border-subtle: rgba(255,255,255,0.08);
+  --border-focus: rgba(255,255,255,0.18);
+  --text-primary: #F5F5F7;
+  --text-secondary: #A1A1A6;
+  --text-muted: #6E6E73;
+  --accent: #FF6B9D;
+  --accent-hover: #FF8DB7;
+  --accent-glow: rgba(255,107,157,0.12);
+  --code-bg: #18181A;
+  --topbar-bg: rgba(18,18,20,0.85);
+  --sidebar-bg: rgba(18,18,20,0.95);
+  --font-body: -apple-system,BlinkMacSystemFont,'Inter','Segoe UI',Roboto,sans-serif;
+  --font-heading: -apple-system,BlinkMacSystemFont,'Inter',sans-serif;
+  --font-mono: 'JetBrains Mono',ui-monospace,SFMono-Regular,Consolas,monospace;
+  --radius-sm: 8px; --radius-md: 14px; --radius-lg: 20px; --radius-xl: 28px;
+  --ease: cubic-bezier(0.25,1,0.5,1);
+  --ease-out: cubic-bezier(0.16,1,0.3,1);
+  --shadow-sm: 0 2px 8px rgba(0,0,0,0.2);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.3);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.4);
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+html[data-theme="oled"] {
+  --bg-base: #000; --bg-surface: #111; --bg-elevated: #1A1A1C;
+  --bg-hover: #222; --code-bg: #09090A;
+  --topbar-bg: rgba(0,0,0,0.85); --sidebar-bg: rgba(0,0,0,0.95);
+  --border-subtle: rgba(255,255,255,0.12);
+}
+
+html[data-theme="light"] {
+  --bg-base: #F2F2F7; --bg-surface: #FFFFFF; --bg-elevated: #F9F9FB;
+  --bg-hover: #E8E8ED; --border-subtle: rgba(0,0,0,0.08);
+  --border-focus: rgba(0,0,0,0.18); --text-primary: #1D1D1F;
+  --text-secondary: #6E6E73; --text-muted: #AEAEB2;
+  --code-bg: #1C1C1E; --topbar-bg: rgba(242,242,247,0.85);
+  --sidebar-bg: rgba(242,242,247,0.95); --accent-glow: rgba(255,107,157,0.08);
+  --shadow-sm: 0 2px 8px rgba(0,0,0,0.08);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.12);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.16);
+}
+
+html.lang-ar {
+  --font-body: system-ui,'Cairo',sans-serif;
+  --font-heading: system-ui,'Cairo',sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; overflow-x: hidden; -webkit-text-size-adjust: 100%; }
+
+body {
+  background: var(--bg-base); color: var(--text-primary);
+  font-family: var(--font-body); font-size: 15.5px; line-height: 1.65;
+  letter-spacing: -0.01em; margin: 0; padding: 0;
+  padding-top: var(--safe-top); padding-bottom: var(--safe-bottom);
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.4s var(--ease), color 0.4s var(--ease);
+  overscroll-behavior: none;
+}
+
+html.lang-ar .code-block, html.lang-ar code { direction: ltr !important; text-align: left; unicode-bidi: embed; }
+html.lang-ar .section-arrow { transform: rotate(180deg); }
+html.lang-ar .section-arrow.open { transform: rotate(90deg); }
+html:not(.lang-ar) .ar, html.lang-ar .en { display: none !important; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 999px; }
+
+.skip-link {
+  position: fixed; top: -100%; left: 50%; transform: translateX(-50%);
+  background: var(--accent); color: #000; padding: 8px 24px; border-radius: 999px;
+  font-weight: 700; font-size: 14px; z-index: 10000; text-decoration: none;
+  transition: top 0.3s var(--ease);
+}
+.skip-link:focus { top: calc(12px + var(--safe-top)); }
+
+.reading-progress {
+  position: fixed; top: 0; left: 0; right: 0; height: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  z-index: 1001; width: 0; pointer-events: none;
+}
+
+.top-bar {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 0.6rem 1rem; max-width: 1200px; margin: 0 auto;
+  background: var(--topbar-bg); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.top-bar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.top-bar-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.menu-btn {
+  display: none; background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); width: 36px; height: 36px; border-radius: 10px;
+  cursor: pointer; align-items: center; justify-content: center;
+  transition: transform 0.2s var(--ease), background-color 0.3s var(--ease);
+  flex-shrink: 0; -webkit-tap-highlight-color: transparent;
+}
+.menu-btn:hover { background: var(--bg-hover); transform: scale(1.05); }
+.menu-btn:active { transform: scale(0.92); }
+.nav-btn {
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); padding: 6px 12px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit;
+  display: flex; align-items: center; gap: 5px; white-space: nowrap;
+  transition: transform 0.2s var(--ease), background-color 0.3s var(--ease);
+  -webkit-tap-highlight-color: transparent; flex-shrink: 0;
+}
+.nav-btn:hover { background: var(--bg-hover); transform: scale(1.03); }
+.nav-btn:active { transform: scale(0.95); }
+.nav-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+.brand {
+  font-weight: 800; font-size: 15px; color: var(--accent);
+  letter-spacing: -0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.search-box {
+  position: relative; display: flex; align-items: center;
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  border-radius: 999px; padding: 0 10px; height: 34px; width: 160px;
+  transition: border-color 0.3s var(--ease), box-shadow 0.3s var(--ease), width 0.3s var(--ease);
+}
+.search-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); width: 220px; }
+.search-box input {
+  background: transparent; border: none; outline: none; color: var(--text-primary);
+  font-family: inherit; font-size: 12.5px; width: 100%; padding: 0 6px; min-width: 0;
+}
+.search-box input::placeholder { color: var(--text-muted); }
+.search-icon { color: var(--text-muted); font-size: 13px; flex-shrink: 0; pointer-events: none; }
+.search-results {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md); max-height: 280px; overflow-y: auto;
+  display: none; box-shadow: var(--shadow-lg); z-index: 200;
+}
+.search-results.active { display: block; }
+.search-result-item {
+  padding: 10px 14px; cursor: pointer; font-size: 13px;
+  color: var(--text-secondary); border-bottom: 1px solid var(--border-subtle);
+  transition: background-color 0.15s, color 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.search-result-item:last-child { border-bottom: none; }
+.search-result-item:hover { background: var(--bg-elevated); color: var(--text-primary); }
+.search-highlight { background: rgba(255,107,157,0.25); color: var(--accent); border-radius: 2px; padding: 0 2px; }
+
+.sidebar-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 199;
+  opacity: 0; pointer-events: none; transition: opacity 0.3s var(--ease);
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+.sidebar-overlay.active { opacity: 1; pointer-events: all; }
+.sidebar {
+  position: fixed; top: 0; bottom: 0; left: 0; width: min(280px, 85vw);
+  background: var(--sidebar-bg); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+  border-right: 1px solid var(--border-subtle); z-index: 200;
+  transform: translateX(-100%); transition: transform 0.4s var(--ease-out);
+  display: flex; flex-direction: column; overflow-y: auto;
+  padding-top: var(--safe-top);
+}
+html[dir="rtl"] .sidebar { left: auto; right: 0; border-right: none; border-left: 1px solid var(--border-subtle); transform: translateX(100%); }
+.sidebar.active { transform: translateX(0); }
+.sidebar-header {
+  padding: 1rem 1.25rem; border-bottom: 1px solid var(--border-subtle);
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+}
+.sidebar-title { font-size: 16px; font-weight: 700; }
+.sidebar-close {
+  background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); width: 30px; height: 30px; border-radius: 8px;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  font-size: 16px; transition: transform 0.2s, background-color 0.3s;
+  -webkit-tap-highlight-color: transparent;
+}
+.sidebar-close:hover { background: var(--bg-hover); transform: scale(1.1); }
+.sidebar-nav { padding: 10px; flex: 1; }
+.sidebar-link {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  border-radius: var(--radius-sm); cursor: pointer; color: var(--text-secondary);
+  font-size: 13.5px; font-weight: 500; text-decoration: none;
+  transition: background-color 0.2s, color 0.2s, transform 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.sidebar-link:hover { background: var(--bg-elevated); color: var(--text-primary); }
+html[dir="ltr"] .sidebar-link:hover { transform: translateX(3px); }
+html[dir="rtl"] .sidebar-link:hover { transform: translateX(-3px); }
+.sidebar-link.active { background: var(--accent-glow); color: var(--accent); font-weight: 600; }
+.sidebar-link-num {
+  width: 22px; height: 22px; border-radius: 6px; background: var(--bg-hover);
+  color: var(--accent); font-size: 10px; font-weight: 700; display: flex;
+  align-items: center; justify-content: center; font-family: var(--font-mono); flex-shrink: 0;
+}
+.sidebar-link.active .sidebar-link-num { background: var(--accent); color: #000; }
+.sidebar-footer {
+  padding: 0.75rem 1.25rem; border-top: 1px solid var(--border-subtle);
+  font-size: 11.5px; color: var(--text-muted); text-align: center; flex-shrink: 0;
+}
+
+.hero {
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl); padding: 3rem 2.5rem 2.5rem;
+  margin: 1.25rem auto 2rem; max-width: 1200px; position: relative;
+  overflow: hidden; box-shadow: var(--shadow-lg);
+}
+.hero::before {
+  content: ''; position: absolute; top: -100px; right: -100px;
+  width: 350px; height: 350px; border-radius: 50%;
+  background: var(--accent-glow); filter: blur(80px); z-index: 0;
+}
+html.lang-ar .hero::before { right: auto; left: -100px; }
+.hero > * { position: relative; z-index: 1; }
+.hero-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: rgba(255,107,157,0.15); color: var(--accent);
+  font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: 5px 12px; border-radius: 999px; margin-bottom: 1.25rem;
+}
+.hero h1 { font-size: clamp(1.8rem, 5vw, 2.75rem); font-weight: 800; color: var(--text-primary); line-height: 1.15; margin: 0 0 0.75rem; }
+html[data-theme="oled"] .hero h1, html:not([data-theme]) .hero h1 { color: #fff; }
+.hero h1 .hl { color: var(--accent); }
+.hero p { color: var(--text-secondary); font-size: 15.5px; max-width: 560px; line-height: 1.6; margin: 0; }
+.hero-tools { display: flex; gap: 8px; margin-top: 2rem; flex-wrap: wrap; }
+.tool-pill {
+  background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  border-radius: 999px; padding: 5px 14px; font-size: 13px; font-weight: 500;
+  font-family: var(--font-mono);
+}
+
+.toc {
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg); padding: 1.75rem; margin-bottom: 2rem;
+  max-width: 1200px; margin-left: auto; margin-right: auto;
+}
+.toc-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+.toc-title {
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--text-secondary);
+}
+.collapse-toggle {
+  background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-secondary); padding: 4px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit;
+  transition: all 0.2s var(--ease); -webkit-tap-highlight-color: transparent;
+}
+.collapse-toggle:hover { background: var(--bg-hover); color: var(--text-primary); }
+.toc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.toc-item {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-radius: var(--radius-sm); cursor: pointer; color: var(--text-secondary);
+  border: 1px solid transparent;
+  transition: transform 0.2s var(--ease), background-color 0.3s var(--ease), border-color 0.3s var(--ease), color 0.3s var(--ease);
+  -webkit-tap-highlight-color: transparent;
+}
+.toc-item:hover { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-focus); transform: scale(1.01); }
+.toc-num {
+  width: 24px; height: 24px; border-radius: 7px; background: var(--bg-hover);
+  color: var(--accent); font-size: 10.5px; font-weight: 700; display: flex;
+  align-items: center; justify-content: center; font-family: var(--font-mono); flex-shrink: 0;
+}
+.toc-label { font-size: 13.5px; font-weight: 600; }
+
+.content-wrapper { max-width: 1200px; margin: 0 auto; padding: 0 1rem 4rem; }
+.section {
+  background: var(--bg-surface); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg); margin-bottom: 1rem; overflow: hidden;
+}
+.section:focus-within { border-color: var(--border-focus); box-shadow: 0 0 0 1px var(--border-focus); }
+.section-header {
+  display: flex; align-items: center; gap: 12px; padding: 1rem 1.25rem;
+  cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent;
+  transition: background-color 0.15s var(--ease);
+}
+.section-header:hover { background: var(--bg-hover); }
+.section-header.active { border-bottom: 1px solid var(--border-subtle); }
+.section-num {
+  width: 32px; height: 32px; border-radius: 9px; background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle); color: var(--accent);
+  font-size: 12px; font-weight: 600; display: flex; align-items: center;
+  justify-content: center; font-family: var(--font-mono); flex-shrink: 0;
+  transition: background-color 0.3s var(--ease), transform 0.3s var(--ease);
+}
+.section-header:hover .section-num { transform: scale(1.05); }
+.section-title { font-size: 15.5px; font-weight: 600; flex: 1; min-width: 0; }
+.section-arrow {
+  color: var(--text-secondary); font-size: 18px; font-family: var(--font-mono);
+  transition: transform 0.4s var(--ease-out), color 0.3s var(--ease);
+  flex-shrink: 0;
+}
+.section-arrow.open { transform: rotate(90deg); color: var(--accent); }
+.section-body {
+  display: grid; grid-template-rows: 0fr;
+  transition: grid-template-rows 0.5s var(--ease-out);
+  will-change: grid-template-rows;
+}
+.section-body.open { grid-template-rows: 1fr; }
+.section-body-inner { overflow: hidden; }
+.section-content { padding: 1.5rem; }
+
+.reveal { opacity: 0; transform: translateY(16px); transition: opacity 0.5s var(--ease-out), transform 0.5s var(--ease-out); }
+.reveal.visible { opacity: 1; transform: translateY(0); }
+
+.step { display: flex; gap: 14px; margin-bottom: 1.5rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border-subtle); }
+.step:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+.step-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow); margin-top: 9px; flex-shrink: 0;
+  transition: box-shadow 0.3s var(--ease);
+}
+.step:hover .step-dot { box-shadow: 0 0 14px var(--accent); }
+.step-content { flex: 1; min-width: 0; }
+.step-title { font-size: 15.5px; font-weight: 600; margin-bottom: 5px; }
+.step-desc { font-size: 14.5px; color: var(--text-secondary); line-height: 1.6; margin-bottom: 6px; }
+
+code, .code-inline {
+  font-family: var(--font-mono); font-size: 13px;
+  background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  border-radius: 5px; padding: 1px 5px; color: var(--text-primary); word-break: break-all;
+}
+html:not([data-theme="light"]) code, html:not([data-theme="light"]) .code-inline { color: #E8E8ED; }
+.code-block {
+  background: var(--code-bg); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md); padding: 1rem 3rem 1rem 1rem;
+  margin: 10px 0; font-family: var(--font-mono); font-size: 13px;
+  color: #F5F5F7; overflow-x: auto; white-space: pre; line-height: 1.6;
+  position: relative; -webkit-overflow-scrolling: touch;
+}
+.code-block:hover .copy-btn { opacity: 1; pointer-events: all; }
+.code-comment { color: #57A168; }
+.code-flag { color: #5E92F3; }
+.code-value { color: #FF9F0A; }
+.code-cmd { color: #34C759; }
+.code-url { color: #AF52DE; }
+.code-label {
+  position: absolute; top: 8px; right: 40px; font-size: 10px;
+  color: var(--text-muted); font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.05em; pointer-events: none;
+}
+.copy-btn {
+  position: absolute; top: 6px; right: 6px;
+  background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); border-radius: 7px; padding: 5px; cursor: pointer;
+  opacity: 0; pointer-events: none;
+  transition: transform 0.2s var(--ease), opacity 0.2s var(--ease), background-color 0.3s var(--ease);
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.copy-btn:hover { background: var(--bg-hover); border-color: var(--border-focus); transform: scale(1.08); }
+.copy-btn:active { transform: scale(0.9); }
+.copy-btn.copied { opacity: 1; pointer-events: all; }
+@media (hover: none) and (pointer: coarse) { .copy-btn { opacity: 1; pointer-events: all; } }
+
+.alert {
+  border-radius: var(--radius-md); padding: 14px; margin: 14px 0;
+  font-size: 14px; display: flex; gap: 12px; align-items: flex-start;
+}
+.alert-icon { flex-shrink: 0; font-size: 16px; margin-top: 1px; }
+.alert-info { background: rgba(10,132,255,0.08); border: 1px solid rgba(10,132,255,0.2); color: #C6E0FF; }
+.alert-info .alert-label { color: #3395FF; }
+.alert-warn { background: rgba(255,159,10,0.08); border: 1px solid rgba(255,159,10,0.2); color: #FFE0B2; }
+.alert-warn .alert-label { color: #FF9F0A; }
+.alert-tip { background: rgba(48,209,88,0.08); border: 1px solid rgba(48,209,88,0.2); color: #C4F5D6; }
+.alert-tip .alert-label { color: #30D158; }
+.alert-label { font-weight: 700; margin-bottom: 3px; font-size: 11.5px; letter-spacing: 0.05em; text-transform: uppercase; }
+
+.cmd-card {
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
+  margin-bottom: 1.25rem; background: var(--bg-surface); overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.3s var(--ease), transform 0.3s var(--ease);
+}
+.cmd-card:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+.cmd-card:last-child { margin-bottom: 0; }
+.cmd-header {
+  background: var(--bg-elevated); padding: 12px 16px; display: flex;
+  align-items: center; gap: 10px; border-bottom: 1px solid var(--border-subtle);
+}
+.cmd-tag {
+  background: var(--accent); color: #000; font-size: 10px; font-weight: 700;
+  padding: 3px 10px; border-radius: 999px; white-space: nowrap;
+  letter-spacing: 0.05em; text-transform: uppercase;
+}
+.cmd-name { font-size: 14.5px; font-weight: 600; line-height: 1.4; flex: 1; }
+.cmd-body { padding: 14px 16px; }
+.cmd-desc { font-size: 14.5px; color: var(--text-secondary); margin-bottom: 10px; line-height: 1.6; }
+
+.grid-list { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 14px; }
+.grid-item {
+  background: var(--bg-surface); padding: 12px 14px; border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle); display: flex; gap: 12px; align-items: flex-start;
+  transition: transform 0.2s var(--ease), border-color 0.3s var(--ease);
+}
+.grid-item:hover { transform: translateY(-1px); border-color: var(--border-focus); }
+.grid-item-icon { font-size: 18px; line-height: 1; margin-top: 2px; }
+.grid-item-text { font-size: 14px; color: var(--text-secondary); line-height: 1.5; }
+.grid-item-text strong { color: var(--text-primary); }
+
+.ref-table-wrapper { overflow-x: auto; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); margin-top: 10px; margin-bottom: 6px; -webkit-overflow-scrolling: touch; }
+.ref-table { width: 100%; border-collapse: collapse; font-size: 14px; text-align: left; }
+html.lang-ar .ref-table { text-align: right; }
+.ref-table th {
+  background: var(--bg-elevated); padding: 10px 14px; font-weight: 600;
+  color: var(--text-primary); border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+.ref-table td {
+  padding: 10px 14px; border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.ref-table tr:last-child td { border-bottom: none; }
+.ref-table td code { color: #5E92F3; font-weight: 600; border: none; background: transparent; padding: 0; }
+
+.back-to-top {
+  position: fixed; bottom: calc(1.5rem + var(--safe-bottom)); right: 1.5rem;
+  width: 42px; height: 42px; background: var(--accent); color: #000;
+  border: none; border-radius: 50%; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-md); z-index: 90;
+  opacity: 0; transform: translateY(16px); pointer-events: none;
+  transition: opacity 0.3s var(--ease), transform 0.3s var(--ease), background-color 0.2s;
+  -webkit-tap-highlight-color: transparent;
+}
+html[dir="rtl"] .back-to-top { right: auto; left: 1.5rem; }
+.back-to-top.visible { opacity: 1; transform: translateY(0); pointer-events: all; }
+.back-to-top:hover { background: var(--accent-hover); transform: translateY(-2px); }
+.back-to-top:active { transform: scale(0.9); }
+
+.toast-container {
+  position: fixed; bottom: calc(1.5rem + var(--safe-bottom)); left: 50%;
+  transform: translateX(-50%); z-index: 1000; display: flex; flex-direction: column;
+  align-items: center; gap: 8px; pointer-events: none;
+}
+.toast {
+  background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  color: var(--text-primary); padding: 10px 20px; border-radius: 999px;
+  font-size: 13px; font-weight: 600; box-shadow: var(--shadow-lg);
+  opacity: 0; transform: translateY(20px); transition: all 0.4s var(--ease-out);
+  pointer-events: none; white-space: nowrap;
+}
+.toast.visible { opacity: 1; transform: translateY(0); }
+
+.footer {
+  text-align: center; color: var(--text-muted); font-size: 13px;
+  margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border-subtle);
+  max-width: 1200px; margin-left: auto; margin-right: auto;
+}
+
+kbd {
+  display: inline-block; padding: 1px 5px; font-family: var(--font-mono);
+  font-size: 11px; background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+  border-radius: 4px; color: var(--text-secondary); line-height: 1.4;
+}
+
+@media (max-width: 768px) {
+  .top-bar { padding: 0.5rem 0.75rem; }
+  .menu-btn { display: flex; }
+  .search-box { width: 120px; }
+  .search-box:focus-within { width: 170px; }
+  .brand { font-size: 14px; }
+  .hero { padding: 2rem 1.25rem 1.75rem; margin: 0.75rem 0.5rem 1.5rem; border-radius: var(--radius-lg); }
+  .hero h1 { font-size: 1.75rem; }
+  .hero p { font-size: 14.5px; }
+  .hero-tools { gap: 6px; margin-top: 1.5rem; }
+  .tool-pill { font-size: 12px; padding: 4px 12px; }
+  .toc { padding: 1.25rem; margin: 0 0.5rem 1.5rem; }
+  .toc-grid { grid-template-columns: 1fr; gap: 6px; }
+  .toc-item { padding: 8px 10px; }
+  .content-wrapper { padding: 0 0.5rem 3rem; }
+  .section-header { padding: 0.9rem 1rem; gap: 10px; }
+  .section-num { width: 28px; height: 28px; font-size: 11px; border-radius: 8px; }
+  .section-title { font-size: 14.5px; }
+  .section-content { padding: 1.25rem 1rem; }
+  .code-block { font-size: 12px; padding: 1rem 3rem 1rem 0.75rem; }
+  .copy-btn { opacity: 1; pointer-events: all; }
+  .ref-table td, .ref-table th { padding: 8px 10px; font-size: 13px; }
+  .cmd-header { flex-wrap: wrap; gap: 8px; }
+  .cmd-body { padding: 12px 14px; }
+  .cmd-card { border-radius: var(--radius-md); }
+  .back-to-top { bottom: calc(1rem + var(--safe-bottom)); right: 1rem; width: 38px; height: 38px; }
+  html[dir="rtl"] .back-to-top { right: auto; left: 1rem; }
+  .toast-container { bottom: calc(1rem + var(--safe-bottom)); }
+  .alert { padding: 12px; font-size: 13.5px; }
+  .grid-item { padding: 10px 12px; }
+}
+
+@media (max-width: 480px) {
+  .nav-btn .btn-label { display: none; }
+  .nav-btn { padding: 6px 8px; }
+  .search-box { width: 100px; }
+  .search-box:focus-within { width: 140px; }
+  .hero h1 { font-size: 1.55rem; }
+  .hero p { font-size: 14px; }
+}
+
+@media print {
+  .top-bar, .sidebar, .sidebar-overlay, .back-to-top, .toast-container, .copy-btn,
+  .menu-btn, .reading-progress, .search-box, .collapse-toggle { display: none !important; }
+  body { background: #fff; color: #000; }
+  .section-body { grid-template-rows: 1fr !important; }
+  .section-body-inner { overflow: visible !important; }
+  .code-block { background: #f5f5f5; border-color: #ddd; color: #333; white-space: pre-wrap; }
+  .section { page-break-inside: avoid; margin-bottom: 1rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; }
+  .reveal { opacity: 1; transform: none; }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+
+<a href="#main-content" class="skip-link">Skip to content</a>
+<div class="reading-progress" id="readingProgress"></div>
+
+<div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+<nav class="sidebar" id="sidebar" role="navigation" aria-label="Main navigation">
+  <div class="sidebar-header">
+    <div class="sidebar-title"><span class="en">Navigation</span><span class="ar">القائمة</span></div>
+    <button class="sidebar-close" id="sidebarClose" aria-label="Close menu">&times;</button>
+  </div>
+  <div class="sidebar-nav" id="sidebarNav"></div>
+  <div class="sidebar-footer">Subs Pipeline v6.0</div>
+</nav>
+
+<header class="top-bar" id="topBar">
+  <div class="top-bar-left">
+    <button class="menu-btn" id="menuBtn" aria-label="Open menu">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <div class="brand">Subs Pipeline</div>
+  </div>
+  <div class="top-bar-right">
+    <div class="search-box" id="searchBox">
+      <span class="search-icon">&#128269;</span>
+      <input type="text" id="searchInput" placeholder="Search..." aria-label="Search guide" autocomplete="off" enterkeyhint="go">
+      <div class="search-results" id="searchResults"></div>
+    </div>
+    <button class="nav-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <span class="btn-label" id="themeLabel">OLED</span>
+    </button>
+    <button class="nav-btn lang-btn" id="langBtn" title="Switch language" aria-label="Switch language">
+      <span class="lang-indicator" id="langIndicator">
+        <span class="lang-current">EN</span>
+        <span class="lang-sep">/</span>
+        <span class="lang-target">عربي</span>
+      </span>
+    </button>
+  </div>
+</header>
+
+<style>
+.lang-btn { gap: 0 !important; padding: 6px 14px !important; }
+.lang-indicator {
+  display: flex; align-items: center; gap: 3px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.02em;
+}
+.lang-current { color: var(--accent); }
+.lang-sep { color: var(--text-muted); font-weight: 400; }
+.lang-target { color: var(--text-secondary); transition: color 0.2s; }
+.lang-btn:hover .lang-target { color: var(--text-primary); }
+html.lang-ar .lang-current { color: var(--text-secondary); }
+html.lang-ar .lang-target { color: var(--accent); }
+</style>
+
+<section class="hero reveal" id="hero">
+  <div class="hero-badge"><span class="en">Use Case: Anime</span><span class="ar">حالة استخدام: أنمي</span></div>
+  <h1><span class="en">Subs Pipeline &mdash; <span class="hl">Transcribe → Translate → Remux</span></span><span class="ar">Subs Pipeline &mdash; <span class="hl">نسخ → ترجمة → دمج</span></span></h1>
+  <p><span class="en">Universal subtitle pipeline for any video. This guide covers the <strong>Anime</strong> use case — Japanese audio to Arabic subtitles, fully automated.</span><span class="ar">خط أنابيب ترجمة عالمي لأي فيديو. هذا الدليل يغطي حالة استخدام <strong>الأنمي</strong> — صوت ياباني إلى ترجمة عربية، تلقائياً بالكامل.</span></p>
+  <div class="hero-tools" dir="ltr"><div class="tool-pill">Python</div><div class="tool-pill">Whisper</div><div class="tool-pill">FFmpeg</div><div class="tool-pill">Gemini AI</div></div>
+</section>
+
+<nav class="toc reveal" aria-label="Table of contents">
+  <div class="toc-header">
+    <div class="toc-title"><span class="en">What's in this guide</span><span class="ar">محتويات الدليل</span></div>
+    <button class="collapse-toggle" id="collapseToggle"><span class="en">Expand All</span><span class="ar">توسيع الكل</span></button>
+  </div>
+  <div class="toc-grid" id="tocGrid"></div>
+</nav>
+
+<main id="main-content" class="content-wrapper" role="main">
+<div id="sectionsContainer"></div>
+</main>
+
+<button class="back-to-top" id="backToTop" aria-label="Back to top">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+</button>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<footer class="footer">
+  <span class="en">Subs Pipeline &mdash; Transcribe &rarr; Translate &rarr; Remux &mdash; v6.0</span>
+  <span class="ar">Subs Pipeline &mdash; النسخ &rarr; الترجمة &rarr; الدمج &mdash; الإصدар 6.0</span>
+</footer>
+
+<script>
+(function() {
+'use strict';
+
+var SECTIONS = [
+  {
+    id: "s0", num: "01",
+    titleEn: "What You Will End Up With", titleAr: "ما الذي ستحصل عليه",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">After setup, you drop videos into any folder, double-click pipeline.bat, answer a few questions, and walk away.</span><span class="ar">بعد الإعداد، ضع مقاطع الفيديو في أي مجلد، انقر مرتين على pipeline.bat، أجب على بعض الأسئلة، وابتعد.</span></div>' +
+      '<div class="step-desc"><span class="en">The script does everything automatically — works for <strong>any language combination</strong>:</span><span class="ar">يعمل السكربت كل شيء تلقائياً — يعمل مع <strong>أي تركيبة لغات</strong>:</span></div>' +
+      '<div class="grid-list" style="margin-bottom:14px">' +
+      '<div class="grid-item"><div class="grid-item-icon">&#127916;</div><div class="grid-item-text"><strong><span class="en">Anime</span><span class="ar">أنمي</span></strong><br><span class="en">Japanese audio → Arabic/English/French subtitles</span><span class="ar">صوت ياباني → ترجمة عربية/إنجليزية/فرنسية</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">&#128249;</div><div class="grid-item-text"><strong><span class="en">Movies & Shows</span><span class="ar">أفلام ومسلسلات</span></strong><br><span class="en">Any audio language → any subtitle language</span><span class="ar">أي لغة صوت → أي لغة ترجمة</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">&#127909;</div><div class="grid-item-text"><strong><span class="en">Lectures & Tutorials</span><span class="ar">محاضرات ودروس</span></strong><br><span class="en">Transcribe & translate educational content</span><span class="ar">نسخ وترجمة المحتوى التعليمي</span></div></div>' +
+      '</div>' +
+      '<div class="step-desc"><span class="en"><strong>This guide uses Anime (Japanese → Arabic) as the example.</strong></span><span class="ar"><strong>هذا الدليل يستخدم الأنمي (اليابانية → العربية) كمثال.</strong></span></div>' +
+      '<div class="code-block"><span class="code-label">Output</span>your-folder/\n  <span class="code-value">├──</span> episode01.mkv              <span class="code-comment">← your original video</span>\n  <span class="code-value">├──</span> episode01.ja.srt           <span class="code-comment">← transcribed subtitles</span>\n  <span class="code-value">├──</span> episode01.ar.srt           <span class="code-comment">← translated subtitles</span>\n  <span class="code-value">├──</span> muxed_ar/\n  <span class="code-value">│     └──</span> episode01.mp4        <span class="code-comment">← video with Arabic subs embedded</span>\n  <span class="code-value">└──</span> logs/\n        <span class="code-value">└──</span> pipeline_20260614.txt  <span class="code-comment">← full log of the session</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s1", num: "02",
+    titleEn: "What You Need to Download", titleAr: "ما تحتاج لتحميله",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Download and save these two script files — they are the only files you need to run the pipeline:</span><span class="ar">حمّل واحفظ هذين الملفين — هما الملفان الوحيدان التي تحتاج لتشغيل الأنابيب:</span></div>' +
+      '<div class="grid-list">' +
+      '<div class="grid-item"><div class="grid-item-icon">&#128196;</div><div class="grid-item-text"><strong>pipeline.py</strong><br><span class="en">The main Python script</span><span class="ar">سكربت Python الرئيسي</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">&#128196;</div><div class="grid-item-text"><strong>pipeline.bat</strong><br><span class="en">Double-click to run (Windows)</span><span class="ar">انقر مرتين للتشغيل (ويندوز)</span></div></div>' +
+      '</div>' +
+      '<div style="background:rgba(10,132,255,0.1);border:1px solid rgba(10,132,255,0.25);border-radius:var(--radius-md);padding:14px 16px;margin-top:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
+      '<div style="flex-shrink:0;font-size:16px">&#128161;</div>' +
+      '<div style="flex:1;min-width:200px;font-size:13.5px;color:var(--text-primary)"><span class="en">Need the code? <strong>Go to Section 3</strong> to copy or download the scripts.</span><span class="ar">تحتاج الكود؟ <strong>اذهب إلى القسم ٣</strong> لنسخ أو تحميل السكربتات.</span></div>' +
+      '<button class="nav-btn" onclick="openSectionFromTOC(2)" style="background:rgba(10,132,255,0.2);color:#3395FF;border:1px solid rgba(10,132,255,0.3);font-weight:600;padding:6px 14px;font-size:12px;cursor:pointer;border-radius:999px;white-space:nowrap;transition:all 0.2s">' +
+      '<span class="en">Go to Section 3 &rarr;</span><span class="ar">&larr; اذهب إلى القسم ٣</span>' +
+      '</button>' +
+      '</div>' +
+      '</div></div>'
+  },
+  {
+    id: "s1b", num: "03",
+    titleEn: "Script Code", titleAr: "كود السكربتات",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Copy or download the scripts below</span><span class="ar">انسخ أو حمّل السكربتات أدناه</span></div>' +
+      '<div class="step-desc"><span class="en">You can copy the code and paste it into a new file, or click the download button to save the file directly.</span><span class="ar">يمكنك نسخ الكود ولصقه في ملف جديد، أو النقر على زر التحميل لحفظ الملف مباشرة.</span></div>' +
+      '<div class="api-key-alert" style="background:linear-gradient(135deg,rgba(255,59,48,0.15),rgba(255,149,0,0.15));border:2px solid #FF3B30;border-radius:var(--radius-md);padding:20px;margin:16px 0;position:relative;overflow:hidden">' +
+      '<div style="position:absolute;top:0;left:0;right:0;height:4px;background:linear-gradient(90deg,#FF3B30,#FF9500,#FF3B30)"></div>' +
+      '<div style="display:flex;align-items:flex-start;gap:14px">' +
+      '<div style="font-size:32px;line-height:1;flex-shrink:0">⚠️</div>' +
+      '<div style="flex:1">' +
+      '<div style="font-weight:800;font-size:18px;color:#FF3B30;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.05em"><span class="en">REQUIRED: Gemini API Key</span><span class="ar">مطلوب: مفتاح Gemini API</span></div>' +
+      '<div style="font-size:14.5px;color:var(--text-primary);line-height:1.6;margin-bottom:12px"><span class="en">The translation step will <strong>NOT work</strong> without a valid Gemini API key. You must get a free key from Google and paste it into pipeline.py before running.</span><span class="ar">خطوة الترجمة <strong>لن تعمل</strong> بدون مفتاح Gemini API صالح. يجب الحصول على مفتاح مجاني من Google ولصقه في pipeline.py قبل التشغيل.</span></div>' +
+      '<button class="nav-btn" onclick="openSectionFromTOC(6)" style="background:#FF3B30;color:#fff;border:none;font-weight:700;padding:10px 20px;font-size:14px;display:inline-flex;align-items:center;gap:8px;cursor:pointer;border-radius:999px;transition:all 0.2s">' +
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 8 12 12 14 14"/><path d="M16.5 19.5 21 21"/></svg>' +
+      '<span class="en">Go to Section 7 &mdash; Get API Key Now</span><span class="ar">اذهب إلى القسم ٧ &mdash; احصل على المفتاح الآن</span>' +
+      '</button>' +
+      '</div>' +
+      '</div>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;margin:12px 0;flex-wrap:wrap">' +
+      '<button class="nav-btn download-btn" data-file="pipeline.py" style="background:var(--accent);color:#000;border:none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> <span class="en">Download pipeline.py</span><span class="ar">تحميل pipeline.py</span></button>' +
+      '<button class="nav-btn download-btn" data-file="pipeline.bat" style="background:var(--accent);color:#000;border:none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> <span class="en">Download pipeline.bat</span><span class="ar">تحميل pipeline.bat</span></button>' +
+      '</div>' +
+      '<div class="step-desc"><span class="en"><strong>pipeline.py</strong> — The main Python script</span><span class="ar"><strong>pipeline.py</strong> — سكربت Python الرئيسي</span></div>' +
+      '<div class="code-block" style="max-height:500px;overflow-y:auto"><span class="code-label">pipeline.py</span><button class="copy-btn" title="Copy code" aria-label="Copy code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>import os\nimport sys\nimport time\nimport shutil\nimport logging\nimport subprocess\n\n# ════════════════════════════════════════════════\n#  PIPELINE DEFAULTS\n# ════════════════════════════════════════════════\nDEFAULT_SRC_LANG     = "ja"\nDEFAULT_MODEL        = "small"\nDEFAULT_DEVICE       = "cuda"\nDEFAULT_COMPUTE      = "float16"\nDEFAULT_BEAM         = 5\nDEFAULT_TEMP         = 0.4\nDEFAULT_VAD          = True\nDEFAULT_COND         = False\nMIN_FILE_SIZE        = 1 * 1024 * 1024\n\nDEFAULT_TGT_LANG     = "Arabic"\nDEFAULT_TGT_EXT      = "ar"\nDEFAULT_API_KEY      = ""\nDEFAULT_RETRIES      = 3\nDEFAULT_RETRY_WAIT   = 10\n\nLOGS_FOLDER          = "logs"\n# ════════════════════════════════════════════════\n\nLANG_EXT_MAP = {\n    "arabic":"ar","english":"en","japanese":"ja","korean":"ko",\n    "french":"fr","german":"de","spanish":"es","chinese":"zh",\n    "turkish":"tr","italian":"it","portuguese":"pt","russian":"ru",\n    "dutch":"nl","polish":"pl","hindi":"hi","persian":"fa",\n    "thai":"th","vietnamese":"vi","indonesian":"id","malay":"ms",\n}\n\n# ── HELPERS ──────────────────────────────────────────────────\ndef ask(prompt, default=""):\n    val = input(prompt).strip()\n    return val if val else default\n\ndef yn(prompt, default_yes=True):\n    hint = "[Y/n]" if default_yes else "[y/N]"\n    val = input(f"  {prompt} {hint}: ").strip().lower()\n    return default_yes if not val else val == "y"\n\ndef fmt_time(s):\n    m, s = divmod(int(s), 60)\n    h, m = divmod(m, 60)\n    if h: return f"{h}h {m}m {s}s"\n    elif m: return f"{m}m {s}s"\n    return f"{s}s"\n\ndef fmt_srt(t):\n    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60\n    return f"{h:02}:{m:02}:{s:06.3f}".replace(".", ",")\n\ndef fmt_size(b):\n    for u in ["B","KB","MB","GB"]:\n        if b < 1024: return f"{b:.1f} {u}"\n        b /= 1024\n    return f"{b:.1f} TB"\n\ndef derive_ext(lang):\n    return LANG_EXT_MAP.get(lang.lower().strip(), lang[:2].lower())\n\ndef is_valid_srt(path):\n    try: return os.path.exists(path) and os.path.getsize(path) > 50\n    except: return False\n\ndef is_utf8(path):\n    try:\n        with open(path, "r", encoding="utf-8") as f: f.read()\n        return True\n    except: return False\n\ndef check_cuda():\n    try:\n        import torch\n        return torch.cuda.is_available()\n    except: return False\n\ndef is_file_ready(path):\n    try:\n        s1 = os.path.getsize(path); time.sleep(0.5); s2 = os.path.getsize(path)\n        return s1 == s2 and s1 >= MIN_FILE_SIZE\n    except: return False\n\ndef safe_base(filename, suffix):\n    if filename.lower().endswith(suffix.lower()):\n        base = filename[: -len(suffix)]\n        if base.endswith(f".{suffix.split(\'.\')[1]}"):\n            return None\n        return base\n    return None\n\ndef check_ffmpeg_mov_text():\n    if not shutil.which("ffmpeg"): return False\n    r = subprocess.run(["ffmpeg", "-codecs"], capture_output=True, text=True)\n    return "mov_text" in r.stdout\n\n# ─────────────────────────────────────────────────────────────\nprint()\nprint("╔══════════════════════════════════════════════╗")\nprint("║   Transcribe → Translate → Remux Pipeline    ║")\nprint("║   v3.0 · Whisper + gst + ffmpeg              ║")\nprint("╚══════════════════════════════════════════════╝")\nprint()\n\n# ── CHECK TOOLS ──────────────────────────────────────────────\ngst_ok   = shutil.which("gst") is not None\nffmpeg_ok = check_ffmpeg_mov_text()\n\nif not gst_ok:\n    print("  [!] \'gst\' not found — translate step unavailable.")\nif not ffmpeg_ok:\n    print("  [!] \'ffmpeg\' not found or missing mov_text — remux step unavailable.")\n\n# ── SETUP ────────────────────────────────────────────────────\nFOLDER   = os.path.dirname(os.path.abspath(__file__))\nSRC_LANG = DEFAULT_SRC_LANG\nMODEL    = DEFAULT_MODEL\nDEVICE   = DEFAULT_DEVICE\nCOMPUTE  = DEFAULT_COMPUTE\nTGT_LANG = DEFAULT_TGT_LANG\nTGT_EXT  = DEFAULT_TGT_EXT\nAPI_KEY  = DEFAULT_API_KEY\nRETRIES  = DEFAULT_RETRIES\nDO_TRANS = True\nDO_XLATE = gst_ok\nDO_REMUX = ffmpeg_ok\n\nprint("  Answer a few questions — then it runs fully unattended.")\nprint()\n\n# Folder\nprint("  Video folder (Enter = script folder):")\ncustom = ask(f"  [{FOLDER}]: ", "")\nif custom and os.path.isdir(custom):\n    FOLDER = custom\nelif custom:\n    print("  [!] Folder not found — using script folder.")\n\n# Source language\nprint()\nSRC_LANG = ask(f"  Transcribe FROM language (Enter = {DEFAULT_SRC_LANG}): ", DEFAULT_SRC_LANG)\n\n# Target language\nprint()\ntgt_input = ask(f"  Translate TO language (Enter = {DEFAULT_TGT_LANG}): ", "").strip()\nif tgt_input:\n    TGT_LANG = tgt_input\n    derived  = derive_ext(tgt_input)\n    TGT_EXT  = ask(f"  Output extension (derived: {derived} — Enter to confirm or correct): ", derived)\nelse:\n    TGT_LANG = DEFAULT_TGT_LANG\n    TGT_EXT  = DEFAULT_TGT_EXT\n\n# Steps\nprint()\nDO_TRANS = yn("Step 1 — Transcribe videos?")\nif gst_ok:\n    DO_XLATE = yn("Step 2 — Translate SRTs?")\nelse:\n    DO_XLATE = False\nif ffmpeg_ok:\n    DO_REMUX = yn("Step 3 — Soft remux translations into videos?")\nelse:\n    DO_REMUX = False\n\nif not DO_TRANS and not DO_XLATE and not DO_REMUX:\n    print("\\n  Nothing to do — all steps disabled. Exiting.")\n    input("\\n  Press Enter to exit...")\n    sys.exit()\n\n# Advanced\nprint()\nprint("  [0]  Use all other defaults and start")\nprint("  [1]  Change model / device / API key")\nprint()\nmode = ask("  Enter 0 or 1 [0]: ", "0")\n\ncuda_available = check_cuda()\n\nif mode == "1":\n    if DO_TRANS:\n        print()\n        print("  Model: tiny/base/small/medium/large-v3-turbo/large-v3")\n        MODEL = ask(f"  [{DEFAULT_MODEL}]: ", DEFAULT_MODEL)\n        print()\n        if cuda_available:\n            DEVICE  = ask(f"  Device cuda/cpu [{DEFAULT_DEVICE}]: ", DEFAULT_DEVICE)\n            COMPUTE = ask(f"  Compute float16/int8 [{DEFAULT_COMPUTE}]: ", DEFAULT_COMPUTE)\n        else:\n            print("  [!] CUDA not available — using CPU/int8.")\n            DEVICE = "cpu"; COMPUTE = "int8"\n    if DO_XLATE:\n        print()\n        key_in = ask("  Gemini API key (Enter = use default): ", "")\n        if key_in: API_KEY = key_in\n        retry_in = ask(f"  Retries on failure [{DEFAULT_RETRIES}]: ", str(DEFAULT_RETRIES))\n        RETRIES = int(retry_in) if retry_in.isdigit() else DEFAULT_RETRIES\nelse:\n    if DO_TRANS and DEVICE == "cuda" and not cuda_available:\n        print("  [!] CUDA not available — switching to CPU/int8.")\n        DEVICE = "cpu"; COMPUTE = "int8"\n\nsrc_suffix  = f".{SRC_LANG}.srt"\ntgt_suffix  = f".{TGT_EXT}.srt"\nremux_dir   = os.path.join(FOLDER, f"muxed_{TGT_EXT}")\n\n# ── SETUP LOGS FOLDER ────────────────────────────────────────\nlogs_dir = os.path.join(FOLDER, LOGS_FOLDER)\nos.makedirs(logs_dir, exist_ok=True)\ntimestamp = time.strftime("%Y%m%d_%H%M%S")\nLOG_FILE  = os.path.join(logs_dir, f"pipeline_{timestamp}.txt")\n\nlogger = logging.getLogger("pipeline")\nlogger.setLevel(logging.INFO)\nfh = logging.FileHandler(LOG_FILE, encoding="utf-8")\nfh.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))\nlogger.addHandler(fh)\n\ndef log(msg):\n    print(msg)\n    logger.info(msg)\n\ndef log_only(msg):\n    logger.info(msg)\n\ndef section(title):\n    print()\n    print(f"  ┌─ {title} {\'─\' * max(1, 42 - len(title))}┐")\n    log_only(f"\\n{\'─\'*50}\\n  {title}\\n{\'─\'*50}")\n\n# ── PRE-SCAN ─────────────────────────────────────────────────\nvid_files = [\n    f for f in os.listdir(FOLDER)\n    if f.lower().endswith((".mkv", ".mp4", ".webm"))\n    and os.path.isfile(os.path.join(FOLDER, f))\n]\nsrt_files = [f for f in os.listdir(FOLDER) if f.lower().endswith(src_suffix)]\n\nsteps_str = "  ".join(filter(None, [\n    "Transcribe" if DO_TRANS else None,\n    f"Translate→{TGT_LANG}" if DO_XLATE else None,\n    "Remux" if DO_REMUX else None,\n]))\n\n# ── CONFIRM ──────────────────────────────────────────────────\nprint()\nprint("╔══════════════════════════════════════════════╗")\nprint("║  Pipeline Ready — will run unattended        ║")\nprint("╠══════════════════════════════════════════════╣")\nprint(f"║  Folder   : {FOLDER}")\nprint(f"║  Steps    : {steps_str}")\nprint(f"║  From     : {SRC_LANG}  |  To: {TGT_LANG} (*.{TGT_EXT}.srt)")\nif DO_REMUX:\n    print(f"║  Remux →  : muxed_{TGT_EXT}\\\\")\nprint(f"║  Videos   : {len(vid_files)}  |  SRTs: {len(srt_files)}")\nprint(f"║  Log      : logs\\\\pipeline_{timestamp}.txt")\nprint("╚══════════════════════════════════════════════╝")\nprint()\nif not yn("Start pipeline?"):\n    print("  Aborted.")\n    log_only("Session aborted by user.")\n    input("\\n  Press Enter to exit...")\n    sys.exit()\n\nlog_only(f"{\'═\'*50}")\nlog_only(f"SESSION START  {time.strftime(\'%Y-%m-%d %H:%M:%S\')}")\nlog_only(f"folder={FOLDER}  src={SRC_LANG}  tgt={TGT_LANG}({TGT_EXT})  model={MODEL}  device={DEVICE}")\nlog_only(f"steps: trans={DO_TRANS} xlate={DO_XLATE} remux={DO_REMUX}")\nlog_only(f"{\'═\'*50}")\n\nsession_start = time.time()\n\n# ═════════════════════════════════════════════════════════════\n#  STEP 1 — TRANSCRIBE\n# ═════════════════════════════════════════════════════════════\nt_done = t_skipped = t_failed = t_partial = 0\n\nif DO_TRANS:\n    section("STEP 1 — TRANSCRIBING")\n\n    all_videos   = [os.path.join(FOLDER, f) for f in vid_files]\n    ready_videos = [fp for fp in all_videos if is_file_ready(fp)]\n    partial      = [fp for fp in all_videos if fp not in ready_videos]\n\n    for fp in partial:\n        log(f"  [!] Partial/incomplete — skipped: {os.path.basename(fp)}")\n        t_partial += 1\n\n    if not ready_videos:\n        log("  [!] No ready video files found.")\n    else:\n        log(f"  {len(ready_videos)} video(s) ready — loading model \'{MODEL}\'...")\n        model = None\n        try:\n            from faster_whisper import WhisperModel\n            model = WhisperModel(MODEL, device=DEVICE, compute_type=COMPUTE)\n            log(f"  Model ready on {DEVICE} ({COMPUTE}).")\n        except Exception as e:\n            log(f"  [FAIL] Model load failed: {e}")\n            log(f"  [!] Transcribe aborted — translate will run on existing SRTs.")\n            t_failed += len(ready_videos)\n\n        if model:\n            step_start = time.time()\n            for i, video_path in enumerate(ready_videos, 1):\n                name      = os.path.splitext(os.path.basename(video_path))[0]\n                srt_path  = os.path.join(FOLDER, f"{name}.{SRC_LANG}.srt")\n                lock_path = srt_path + ".lock"\n\n                if is_valid_srt(srt_path):\n                    log(f"  [SKIP] {name}")\n                    t_skipped += 1\n                    continue\n                if os.path.exists(lock_path):\n                    log(f"  [SKIP] {name}  (locked)")\n                    t_skipped += 1\n                    continue\n\n                log(f"  [{i}/{len(ready_videos)}] {name}")\n                open(lock_path, "w").close()\n                t0 = time.time()\n                try:\n                    segments, info = model.transcribe(\n                        video_path, language=SRC_LANG,\n                        beam_size=DEFAULT_BEAM, vad_filter=DEFAULT_VAD,\n                        condition_on_previous_text=DEFAULT_COND,\n                        temperature=DEFAULT_TEMP,\n                    )\n                    if hasattr(info, \'language_probability\'):\n                        detected = getattr(info, \'language\', SRC_LANG)\n                        prob = info.language_probability\n                        if detected != SRC_LANG:\n                            log(f"  [!] Lang mismatch: expected {SRC_LANG}, got {detected} ({prob:.0%})")\n\n                    count = 0\n                    with open(srt_path, "w", encoding="utf-8-sig") as f:\n                        for idx, seg in enumerate(segments, 1):\n                            text = seg.text.strip()\n                            if not text: continue\n                            f.write(f"{idx}\\n{fmt_srt(seg.start)} --> {fmt_srt(seg.end)}\\n{text}\\n\\n")\n                            count = idx\n\n                    elapsed = fmt_time(time.time() - t0)\n                    if count == 0:\n                        log(f"  [!] WARNING: 0 segments for {name}")\n                    else:\n                        log(f"  [✓] {name}  {count} segments  ({elapsed})")\n                    t_done += 1\n\n                except Exception as e:\n                    log(f"  [✗] FAILED {name}: {e}")\n                    if os.path.exists(srt_path):\n                        try: os.remove(srt_path)\n                        except: pass\n                    t_failed += 1\n                finally:\n                    if os.path.exists(lock_path):\n                        try: os.remove(lock_path)\n                        except: pass\n\n            log(f"\\n  Transcribe: ✓{t_done}  →{t_skipped}  ✗{t_failed}  ⚠{t_partial}  ({fmt_time(time.time()-step_start)})")\n\n# ═════════════════════════════════════════════════════════════\n#  STEP 2 — TRANSLATE\n# ═════════════════════════════════════════════════════════════\nx_done = x_skipped = x_failed = 0\n\nif DO_XLATE:\n    section("STEP 2 — TRANSLATING")\n\n    seen_bases = set()\n    xlate_files = []\n    for f in sorted(os.listdir(FOLDER)):\n        if not f.lower().endswith(src_suffix): continue\n        base = safe_base(f, src_suffix)\n        if base is None:\n            log(f"  [!] Malformed filename skipped: {f}"); continue\n        if base in seen_bases:\n            log(f"  [!] Duplicate skipped: {f}"); continue\n        seen_bases.add(base)\n        src_path = os.path.join(FOLDER, f)\n        tgt_path = os.path.join(FOLDER, f"{base}{tgt_suffix}")\n        if is_valid_srt(tgt_path):\n            x_skipped += 1; continue\n        if not is_valid_srt(src_path) or not is_utf8(src_path):\n            log(f"  [!] Invalid/non-UTF8 SRT skipped: {f}"); continue\n        xlate_files.append((src_path, tgt_path, base))\n\n    if not xlate_files:\n        log(f"  [!] No SRTs to translate  ({x_skipped} already done).")\n    else:\n        log(f"  {len(xlate_files)} SRT(s) to translate...")\n        step_start = time.time()\n        for i, (src_path, tgt_path, base) in enumerate(xlate_files, 1):\n            log(f"  [{i}/{len(xlate_files)}] {base}")\n            t0 = time.time()\n            success = False\n            for attempt in range(1, RETRIES + 1):\n                result = subprocess.run(\n                    ["gst", "translate", "-i", src_path, "-o", tgt_path,\n                     "-l", TGT_LANG, "-k", API_KEY],\n                )\n                if result.returncode == 0 and is_valid_srt(tgt_path):\n                    success = True; break\n                if attempt < RETRIES:\n                    wait = DEFAULT_RETRY_WAIT * attempt\n                    log(f"  [!] Attempt {attempt} failed — retry in {wait}s...")\n                    time.sleep(wait)\n                else:\n                    if os.path.exists(tgt_path) and not is_valid_srt(tgt_path):\n                        try: os.remove(tgt_path)\n                        except: pass\n\n            elapsed = fmt_time(time.time() - t0)\n            if success:\n                log(f"  [✓] {base}  ({elapsed})"); x_done += 1\n            else:\n                log(f"  [✗] FAILED {base} after {RETRIES} attempts"); x_failed += 1\n\n        log(f"\\n  Translate: ✓{x_done}  →{x_skipped}  ✗{x_failed}  ({fmt_time(time.time()-step_start)})")\n\n# ═════════════════════════════════════════════════════════════\n#  STEP 3 — SOFT REMUX\n# ═════════════════════════════════════════════════════════════\nr_done = r_skipped = r_failed = 0\n\nif DO_REMUX:\n    section("STEP 3 — SOFT REMUXING")\n    os.makedirs(remux_dir, exist_ok=True)\n\n    vid_exts = (".mp4", ".mkv", ".avi", ".mov", ".webm")\n    seen_bases = set()\n    remux_files = []\n\n    for f in os.listdir(FOLDER):\n        fpath = os.path.join(FOLDER, f)\n        if not os.path.isfile(fpath): continue\n        if not f.lower().endswith(vid_exts): continue\n        base = os.path.splitext(f)[0]\n        if base in seen_bases:\n            log(f"  [!] Duplicate base skipped: {f}"); continue\n        seen_bases.add(base)\n\n        srt_path = os.path.join(FOLDER, f"{base}{tgt_suffix}")\n        out_path = os.path.join(remux_dir, f"{base}.mp4")\n\n        if not is_valid_srt(srt_path):\n            log(f"  [SKIP] {f}  (no {tgt_suffix} found)")\n            r_skipped += 1; continue\n        if not is_utf8(srt_path):\n            log(f"  [SKIP] {f}  (SRT not valid UTF-8)")\n            r_skipped += 1; continue\n        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:\n            log(f"  [SKIP] {f}  (output exists)")\n            r_skipped += 1; continue\n\n        remux_files.append((fpath, srt_path, out_path, base))\n\n    if not remux_files:\n        log(f"  [!] No videos to remux  ({r_skipped} skipped).")\n    else:\n        log(f"  {len(remux_files)} video(s) to remux...")\n        step_start = time.time()\n        for i, (video_path, srt_path, out_path, base) in enumerate(remux_files, 1):\n            log(f"  [{i}/{len(remux_files)}] {base}")\n            orig_size = os.path.getsize(video_path)\n\n            cmd = [\n                "ffmpeg",\n                "-i", video_path,\n                "-i", srt_path,\n                "-map", "0",\n                "-map", "1",\n                "-c", "copy",\n                "-c:s", "mov_text",\n                "-metadata:s:s:0", f"language={TGT_EXT}",\n                "-y", out_path,\n                "-loglevel", "error",\n            ]\n            result = subprocess.run(cmd, capture_output=True, text=True)\n\n            if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:\n                out_size = os.path.getsize(out_path)\n                diff = ((out_size - orig_size) / orig_size) * 100\n                sign = "+" if diff >= 0 else ""\n                log(f"  [✓] {base}  {fmt_size(orig_size)} → {fmt_size(out_size)} ({sign}{diff:.1f}%)")\n                r_done += 1\n            else:\n                err = result.stderr.strip() if result.stderr else "(no error output)"\n                log(f"  [✗] FAILED {base}: {err}")\n                if os.path.exists(out_path):\n                    try: os.remove(out_path)\n                    except: pass\n                r_failed += 1\n\n        log(f"\\n  Remux: ✓{r_done}  →{r_skipped}  ✗{r_failed}  ({fmt_time(time.time()-step_start)})")\n\n# ── FINAL REPORT ─────────────────────────────────────────────\ntotal_elapsed = fmt_time(time.time() - session_start)\nprint()\nprint("╔══════════════════════════════════════════════╗")\nprint("║  Pipeline Complete                           ║")\nprint("╠══════════════════════════════════════════════╣")\nif DO_TRANS:\n    print(f"║  Transcribe  ✓{t_done}  →{t_skipped}  ✗{t_failed}  ⚠partial:{t_partial}")\nif DO_XLATE:\n    print(f"║  Translate   ✓{x_done}  →{x_skipped}  ✗{x_failed}")\nif DO_REMUX:\n    print(f"║  Remux       ✓{r_done}  →{r_skipped}  ✗{r_failed}")\nprint(f"║  ⏱ Total     : {total_elapsed}")\nprint(f"║  📄 Log      : logs\\\\pipeline_{timestamp}.txt")\nprint("╚══════════════════════════════════════════════╝")\nprint()\nlog_only(f"\\nSESSION END  {time.strftime(\'%Y-%m-%d %H:%M:%S\')}  total={total_elapsed}")\nlog_only(f"{\'═\'*50}\\n")\ninput("  Press Enter to exit...")</div>' +
+      '</div></div>' +
+      '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-desc"><span class="en"><strong>pipeline.bat</strong> — Double-click to run (Windows)</span><span class="ar"><strong>pipeline.bat</strong> — انقر مرتين للتشغيل (ويندوز)</span></div>' +
+      '<div class="code-block"><span class="code-label">pipeline.bat</span><button class="copy-btn" title="Copy code" aria-label="Copy code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>@echo off\npython "%~dp0%~n0.py"\npause</div>' +
+      '</div></div>'
+  },
+  {
+    id: "s2", num: "04",
+    titleEn: "Install Python", titleAr: "تثبيت Python",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 1 &mdash; Go to python.org/downloads</span><span class="ar">الخطوة ١ &mdash; اذهب إلى python.org/downloads</span></div>' +
+      '<div class="step-desc"><span class="en">Click the big yellow Download Python button. Run the installer.</span><span class="ar">انقر على زر التحميل الأصفر الكبير. شغّل المُثبّت.</span></div>' +
+      '<div class="alert alert-warn" style="margin:10px 0">' +
+      '<div class="alert-icon">&#9888;</div>' +
+      '<div><div class="alert-label"><span class="en">Critical</span><span class="ar">مهم جداً</span></div>' +
+      '<span class="en">On the first screen, check the box that says <strong>"Add Python to PATH"</strong> before clicking Install.</span>' +
+      '<span class="ar">في الشاشة الأولى، ضع علامة على <strong>"Add Python to PATH"</strong> قبل النقر على Install.</span></div></div>' +
+      '<div class="step-desc"><span class="en">Click Install Now and wait for it to finish.</span><span class="ar">انقر Install Now وانتظر حتى ينتهي.</span></div>' +
+      '<div class="step-desc"><span class="en">Test it: open CMD (press Win + R, type cmd, Enter) and run:</span><span class="ar">اختبره: افتح CMD (اضغط Win + R، اكتب cmd، Enter) وشغّل:</span></div>' +
+      '<div class="code-block"><span class="code-label">CMD</span><span class="code-cmd">python</span> <span class="code-flag">--version</span></div>' +
+      '<div class="step-desc"><span class="en">You should see something like Python 3.12.0</span><span class="ar">يجب أن ترى شيئاً مثل Python 3.12.0</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s3", num: "05",
+    titleEn: "Install faster-whisper", titleAr: "تثبيت faster-whisper",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 2 &mdash; Install Transcription Engine</span><span class="ar">الخطوة ٢ &mdash; تثبيت محرك النسخ</span></div>' +
+      '<div class="step-desc"><span class="en">In CMD, run:</span><span class="ar">في CMD، شغّل:</span></div>' +
+      '<div class="code-block"><span class="code-label">CMD</span><span class="code-cmd">pip install</span> faster-whisper</div>' +
+      '<div class="step-desc"><span class="en">This is the AI that listens to your videos and writes the subtitles.</span><span class="ar">هذا هو الذكاء الاصطناعي الذي يستمع إلى مقاطع الفيديو ويكتب الترجمات.</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s4", num: "06",
+    titleEn: "Install gst-translator", titleAr: "تثبيت gst-translator",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 3 &mdash; Install Translation Tool</span><span class="ar">الخطوة ٣ &mdash; تثبيت أداة الترجمة</span></div>' +
+      '<div class="step-desc"><span class="en">In CMD, run:</span><span class="ar">في CMD، شغّل:</span></div>' +
+      '<div class="code-block"><span class="code-label">CMD</span><span class="code-cmd">pip install</span> gst-translator</div>' +
+      '<div class="step-desc"><span class="en">This is the tool that translates your subtitles using Google\'s Gemini AI.</span><span class="ar">هذه هي الأداة التي تترجم ترجماتك باستخدام Gemini AI من Google.</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s5", num: "07",
+    titleEn: "Get Gemini API Key", titleAr: "الحصول على مفتاح Gemini API",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 4 &mdash; Required for Translation</span><span class="ar">الخطوة ٤ &mdash; مطلوب للترجمة</span></div>' +
+      '<div class="step-desc"><span class="en">The translation step needs a free API key from Google. Here is how to get one:</span><span class="ar">خطوة الترجمة تحتاج مفتاح API مجاني من Google. إليك كيفية الحصول عليه:</span></div>' +
+      '<div class="grid-list">' +
+      '<div class="grid-item"><div class="grid-item-icon">1.</div><div class="grid-item-text"><span class="en">Go to <strong>aistudio.google.com/apikey</strong></span><span class="ar">اذهب إلى <strong>aistudio.google.com/apikey</strong></span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">2.</div><div class="grid-item-text"><span class="en">Sign in with your Google account</span><span class="ar">سجّل الدخول بحساب Google الخاص بك</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">3.</div><div class="grid-item-text"><span class="en">Click "Create API key"</span><span class="ar">انقر "Create API key"</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">4.</div><div class="grid-item-text"><span class="en">Copy the key &mdash; it looks like: <code>XXXXXXXXXXXXXXXXXXXXXXXXXXX</code></span><span class="ar">انسخ المفتاح &mdash; يبدو هكذا: <code>AIzaSyXXXXXXXXXXXXXXXXXXXXXX</code></span></div></div>' +
+      '</div>' +
+      '<div class="step-desc" style="margin-top:14px"><span class="en">Now open pipeline.py in Notepad (right-click → Open with → Notepad) and find this line near the top:</span><span class="ar">الآن افتح pipeline.py في Notepad (انقر يميناً → Open with → Notepad) وابحث عن هذا السطر بالقرب من الأعلى:</span></div>' +
+      '<div class="code-block"><span class="code-label">Python</span><span class="code-value">DEFAULT_API_KEY</span>      = <span class="code-flag">""</span></div>' +
+      '<div class="step-desc"><span class="en">Paste your key between the quotes. Save the file. You only need to do this once.</span><span class="ar">الصق مفتاحك بين علامتي التنصيص. احفظ الملف. تحتاج لفعل هذا مرة واحدة فقط.</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s6", num: "08",
+    titleEn: "Install ffmpeg", titleAr: "تثبيت ffmpeg",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 5 &mdash; Video Muxing</span><span class="ar">الخطوة ٥ &mdash; دمج الفيديو</span></div>' +
+      '<div class="step-desc"><span class="en">ffmpeg is the tool that embeds the subtitles into the video file.</span><span class="ar">ffmpeg هي الأداة التي تضمن الترجمات في ملف الفيديو.</span></div>' +
+      '<div class="grid-list">' +
+      '<div class="grid-item"><div class="grid-item-icon">1.</div><div class="grid-item-text"><span class="en">Go to <strong>gyan.dev/ffmpeg/builds/</strong></span><span class="ar">اذهب إلى <strong>gyan.dev/ffmpeg/builds/</strong></span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">2.</div><div class="grid-item-text"><span class="en">Under "release builds", download <code>ffmpeg-release-essentials.zip</code></span><span class="ar">تحت "release builds"، حمّل <code>ffmpeg-release-essentials.zip</code></span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">3.</div><div class="grid-item-text"><span class="en">Extract the zip file anywhere &mdash; for example to <code>C:\ffmpeg</code></span><span class="ar">استخرج ملف الـ zip في أي مكان &mdash; مثلاً إلى <code>C:\ffmpeg</code></span></div></div>' +
+      '</div>' +
+      '<div class="step-desc" style="margin-top:14px"><span class="en">Now add it to Windows PATH:</span><span class="ar">الآن أضفه إلى مسار ويندوز:</span></div>' +
+      '<div class="grid-list">' +
+      '<div class="grid-item"><div class="grid-item-icon">1.</div><div class="grid-item-text"><span class="en">Press Win, search "Edit the system environment variables", open it</span><span class="ar">اضغط Win، ابحث عن "Edit the system environment variables"، وافتحه</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">2.</div><div class="grid-item-text"><span class="en">Click "Environment Variables" at the bottom</span><span class="ar">انقر "Environment Variables" في الأسفل</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">3.</div><div class="grid-item-text"><span class="en">Under "System variables", find "Path", click it, then click "Edit"</span><span class="ar">تحت "System variables"، ابحث عن "Path"، انقر عليه، ثم انقر "Edit"</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">4.</div><div class="grid-item-text"><span class="en">Click "New" and paste the full path to the bin folder (e.g. <code>C:\ffmpeg\ffmpeg-7.x-essentials_build\bin</code>)</span><span class="ar">انقر "New" والصق المسار الكامل لمجلد bin (مثل <code>C:\ffmpeg\ffmpeg-7.x-essentials_build\bin</code>)</span></div></div>' +
+      '<div class="grid-item"><div class="grid-item-icon">5.</div><div class="grid-item-text"><span class="en">Click OK on all windows. Close CMD and reopen it.</span><span class="ar">انقر OK على جميع النوافذ. أغلق CMD وأعد فتحه.</span></div></div>' +
+      '</div>' +
+      '<div class="code-block"><span class="code-label">Test</span><span class="code-cmd">ffmpeg</span> <span class="code-flag">-version</span>\n<span class="code-comment"># Should show version information printed</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s7", num: "09",
+    titleEn: "GPU Acceleration", titleAr: "تسريع GPU",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 6 &mdash; Optional &mdash; Nvidia GPU Only</span><span class="ar">الخطوة ٦ &mdash; اختياري &mdash; لـ Nvidia GPU فقط</span></div>' +
+      '<div class="step-desc"><span class="en">If you have an Nvidia graphics card, this makes transcription 5–10× faster. Skip this step if you have no Nvidia GPU &mdash; everything still works, just slower.</span><span class="ar">إذا كان لديك كرت شاشة من Nvidia، يجعل النسخ أسرع ٥-١٠ مرات. تخطَّ هذه الخطوة إذا لم يكن لديك GPU من Nvidia &mdash; كل شيء يعمل، لكن أبطأ.</span></div>' +
+      '<div class="code-block"><span class="code-label">CMD</span><span class="code-cmd">pip install</span> torch <span class="code-flag">--index-url</span> <span class="code-url">https://download.pytorch.org/whl/cu121</span></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s8", num: "10",
+    titleEn: "Run the Pipeline", titleAr: "شغّل الأنابيب",
+    content: '<div class="step"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Step 7 &mdash; Copy Scripts and Double-Click</span><span class="ar">الخطوة ٧ &mdash; انسخ السكربتات وانقر مرتين</span></div>' +
+      '<div class="step-desc"><span class="en">Copy pipeline.py and pipeline.bat into the folder that contains your videos. Double-click pipeline.bat.</span><span class="ar">انسخ pipeline.py و pipeline.bat إلى المجلد الذي يحتوي على مقاطع الفيديو. انقر مرتين على pipeline.bat.</span></div>' +
+      '<div class="step-desc"><span class="en">A black window will open and ask you a few questions:</span><span class="ar">ستنفتح نافذة سوداء وتسألك بضع أسئلة:</span></div>' +
+      '<div class="ref-table-wrapper">' +
+      '<table class="ref-table">' +
+      '<tr><th><span class="en">Question</span><span class="ar">السؤال</span></th><th><span class="en">What to type</span><span class="ar">ماذا تكتب</span></th></tr>' +
+      '<tr><td><span class="en">Video folder?</span><span class="ar">مجلد الفيديو؟</span></td><td><span class="en">Press Enter (it uses the current folder)</span><span class="ar">اضغط Enter (يستخدم المجلد الحالي)</span></td></tr>' +
+      '<tr><td><span class="en">Transcribe FROM language?</span><span class="ar">نسخ من لغة؟</span></td><td><span class="en"><code>ja</code> for Japanese, <code>en</code> for English, etc.</span><span class="ar"><code>ja</code> لليابانية، <code>en</code> للإنجليزية، إلخ</span></td></tr>' +
+      '<tr><td><span class="en">Translate TO language?</span><span class="ar">ترجمة إلى لغة؟</span></td><td><span class="en">Arabic, English, French, etc.</span><span class="ar">العربية، الإنجليزية، الفرنسية، إلخ</span></td></tr>' +
+      '<tr><td><span class="en">Output extension?</span><span class="ar">امتداد الإخراج؟</span></td><td><span class="en">Press Enter to confirm the suggested one</span><span class="ar">اضغط Enter للتأكيد</span></td></tr>' +
+      '<tr><td><span class="en">Run transcribe step?</span><span class="ar">تشغيل خطوة النسخ؟</span></td><td><code>Y</code></td></tr>' +
+      '<tr><td><span class="en">Run translate step?</span><span class="ar">تشغيل خطوة الترجمة؟</span></td><td><code>Y</code></td></tr>' +
+      '<tr><td><span class="en">Run remux step?</span><span class="ar">تشغيل خطوة الدمج؟</span></td><td><code>Y</code></td></tr>' +
+      '<tr><td><span class="en">Start pipeline?</span><span class="ar">بدء الأنابيب؟</span></td><td><code>Y</code></td></tr>' +
+      '</table></div>' +
+      '<div class="alert alert-tip" style="margin-top:1rem">' +
+      '<div class="alert-icon">&#9889;</div>' +
+      '<div><div class="alert-label"><span class="en">After that</span><span class="ar">بعد ذلك</span></div>' +
+      '<span class="en">Do not touch anything. It runs fully automatically until done.</span>' +
+      '<span class="ar">لا تلمس أي شيء. يعمل تلقائياً بالكامل حتى ينتهي.</span></div></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s9", num: "11",
+    titleEn: "Language Codes", titleAr: "أكواد اللغات",
+    content: '<div class="step" style="border-bottom:none;padding-bottom:0;margin-bottom:0"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Use these codes when asked for the transcription language</span><span class="ar">استخدم هذه الأكواد عندما يُسألك عن لغة النسخ</span></div>' +
+      '<div class="ref-table-wrapper" style="margin-top:8px">' +
+      '<table class="ref-table">' +
+      '<tr><th><span class="en">Language</span><span class="ar">اللغة</span></th><th><span class="en">Code</span><span class="ar">الكود</span></th></tr>' +
+      '<tr><td><span class="en">Japanese</span><span class="ar">اليابانية</span></td><td><code>ja</code></td></tr>' +
+      '<tr><td><span class="en">English</span><span class="ar">الإنجليزية</span></td><td><code>en</code></td></tr>' +
+      '<tr><td><span class="en">Arabic</span><span class="ar">العربية</span></td><td><code>ar</code></td></tr>' +
+      '<tr><td><span class="en">Korean</span><span class="ar">الكورية</span></td><td><code>ko</code></td></tr>' +
+      '<tr><td><span class="en">Chinese</span><span class="ar">الصينية</span></td><td><code>zh</code></td></tr>' +
+      '<tr><td><span class="en">French</span><span class="ar">الفرنسية</span></td><td><code>fr</code></td></tr>' +
+      '<tr><td><span class="en">Spanish</span><span class="ar">الإسبانية</span></td><td><code>es</code></td></tr>' +
+      '<tr><td><span class="en">German</span><span class="ar">الألمانية</span></td><td><code>de</code></td></tr>' +
+      '<tr><td><span class="en">Turkish</span><span class="ar">التركية</span></td><td><code>tr</code></td></tr>' +
+      '</table></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s10", num: "12",
+    titleEn: "Troubleshooting", titleAr: "حل المشاكل",
+    content: '<div class="step" style="border-bottom:none;padding-bottom:0;margin-bottom:0"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">Common Issues & Fixes</span><span class="ar">المشاكل الشائعة والحلول</span></div>' +
+      '<div class="ref-table-wrapper" style="margin-top:8px">' +
+      '<table class="ref-table">' +
+      '<tr><th><span class="en">Problem</span><span class="ar">المشكلة</span></th><th><span class="en">Fix</span><span class="ar">الحل</span></th></tr>' +
+      '<tr><td><code>python is not recognized</code></td><td><span class="en">Re-install Python and check <strong>"Add to PATH"</strong></span><span class="ar">أعد تثبيت Python وتحقق من <strong>"Add to PATH"</strong></span></td></tr>' +
+      '<tr><td><code>pip is not recognized</code></td><td><span class="en">Same as above</span><span class="ar">نفس ما سبق</span></td></tr>' +
+      '<tr><td><code>ffmpeg is not recognized</code></td><td><span class="en">Redo Step 5 &mdash; make sure you added the bin folder path, then restart CMD</span><span class="ar">أعد الخطوة ٥ &mdash; تأكد من إضافة مسار مجلد bin، ثم أعد تشغيل CMD</span></td></tr>' +
+      '<tr><td><span class="en">Translation step fails immediately</span><span class="ar">خطوة الترجمة تفشل فوراً</span></td><td><span class="en">Your API key is missing or wrong &mdash; re-check Step 4</span><span class="ar">مفتاح API مفقود أو خاطئ &mdash; أعد التحقق من الخطوة ٤</span></td></tr>' +
+      '<tr><td><span class="en">Translation step fails mid-way</span><span class="ar">خطوة الترجمة تفشل في منتصف الطريق</span></td><td><span class="en">Gemini free tier has rate limits &mdash; the script retries automatically, just wait</span><span class="ar">الطبقة المجانية من Gemini لها حدود &mdash; يعيد السكربت المحاولة تلقائياً، فقط انتظر</span></td></tr>' +
+      '<tr><td><span class="en">Transcription is very slow</span><span class="ar">النسخ بطيء جداً</span></td><td><span class="en">You are on CPU mode &mdash; install CUDA (Step 6) if you have Nvidia GPU</span><span class="ar">أنت في وضع CPU &mdash; ثبّت CUDA (الخطوة ٦) إذا كان لديك GPU من Nvidia</span></td></tr>' +
+      '<tr><td><span class="en">Subtitles show black squares</span><span class="ar">الترجمات تظهر بمربعات سوداء</span></td><td><span class="en">Install the <strong>Cairo font</strong> on your PC (only relevant for hard-sub burning)</span><span class="ar">ثبّت خط <strong>Cairo</strong> على جهازك (مهم فقط لحرق الترجمات)</span></td></tr>' +
+      '<tr><td><span class="en">No videos found</span><span class="ar">لم يتم العثور على فيديو</span></td><td><span class="en">Make sure your video files are .mp4, .mkv, or .webm</span><span class="ar">تأكد أن ملفات الفيديو بامتداد .mp4 أو .mkv أو .webm</span></td></tr>' +
+      '</table></div>' +
+      '</div></div>'
+  },
+  {
+    id: "s11", num: "13",
+    titleEn: "One-Time vs Every-Time", titleAr: "مرة واحدة vs كل مرة",
+    content: '<div class="step" style="border-bottom:none;padding-bottom:0;margin-bottom:0"><div class="step-dot"></div><div class="step-content">' +
+      '<div class="step-title"><span class="en">What to do once vs every time</span><span class="ar">ماذا تفعل مرة واحدة مقابل كل مرة</span></div>' +
+      '<div class="ref-table-wrapper" style="margin-top:8px">' +
+      '<table class="ref-table">' +
+      '<tr><th><span class="en">Task</span><span class="ar">المهمة</span></th><th><span class="en">How Often</span><span class="ar">كم مرة</span></th></tr>' +
+      '<tr><td><span class="en">Install Python</span><span class="ar">تثبيت Python</span></td><td><span class="en">Once</span><span class="ar">مرة واحدة</span></td></tr>' +
+      '<tr><td><span class="en">Install faster-whisper, gst, ffmpeg</span><span class="ar">تثبيت faster-whisper و gst و ffmpeg</span></td><td><span class="en">Once</span><span class="ar">مرة واحدة</span></td></tr>' +
+      '<tr><td><span class="en">Get Gemini API key + paste into pipeline.py</span><span class="ar">الحصول على مفتاح Gemini API + لصقه في pipeline.py</span></td><td><span class="en">Once</span><span class="ar">مرة واحدة</span></td></tr>' +
+      '<tr><td><span class="en">Install CUDA (optional)</span><span class="ar">تثبيت CUDA (اختياري)</span></td><td><span class="en">Once</span><span class="ar">مرة واحدة</span></td></tr>' +
+      '<tr><td><span class="en">Copy pipeline.py + pipeline.bat to video folder</span><span class="ar">نسخ pipeline.py + pipeline.bat إلى مجلد الفيديو</span></td><td><span class="en">Every new folder</span><span class="ar">كل مجلد جديد</span></td></tr>' +
+      '<tr><td><span class="en">Double-click pipeline.bat</span><span class="ar">انقر مرتين على pipeline.bat</span></td><td><span class="en">Every time you have new videos</span><span class="ar">كل مرة يكون لديك فيديو جديد</span></td></tr>' +
+      '</table></div>' +
+      '</div></div>'
+  }
+];
+
+var SECTION_TITLES = SECTIONS.map(function(s) { return { num: s.num, titleEn: s.titleEn, titleAr: s.titleAr, id: s.id }; });
+var currentTheme = localStorage.getItem('ytGuideTheme') || null;
+var currentLang = localStorage.getItem('ytGuideLang') || 'en';
+var allExpanded = false;
+var toastQueue = [];
+var toastShowing = false;
+
+function $(id) { return document.getElementById(id); }
+
+document.addEventListener('DOMContentLoaded', function() {
+  if (currentLang === 'ar') {
+    document.documentElement.lang = 'ar';
+    document.documentElement.dir = 'rtl';
+    document.documentElement.classList.add('lang-ar');
+  }
+  updateLangBtn();
+  if (currentTheme === null) {
+    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var hour = new Date().getHours();
+    var nightTime = hour >= 19 || hour < 7;
+    currentTheme = (prefersDark || nightTime) ? 'soft' : 'light';
+  }
+  applyTheme();
+  buildTOC(); buildSidebar(); buildSections();
+  initScrollReveal(); initCopyButtons(); initSearch(); initDownloadButtons();
+  initScrollHandler(); initKeyboardShortcuts();
+  initSidebarActiveLink(); initEventDelegation();
+  if (window.innerWidth > 768) toggleSection(0);
+});
+
+function initEventDelegation() {
+  $('sidebarOverlay').addEventListener('click', closeSidebar);
+  $('sidebarClose').addEventListener('click', closeSidebar);
+  $('menuBtn').addEventListener('click', toggleSidebar);
+  $('themeBtn').addEventListener('click', cycleTheme);
+  $('langBtn').addEventListener('click', toggleLang);
+  $('backToTop').addEventListener('click', function() { window.scrollTo({top:0,behavior:'smooth'}); });
+  $('collapseToggle').addEventListener('click', toggleAllSections);
+  $('sectionsContainer').addEventListener('click', function(e) {
+    var header = e.target.closest('.section-header');
+    if (!header) return;
+    var section = header.closest('.section');
+    var idx = SECTIONS.findIndex(function(s) { return section && section.id === s.id; });
+    if (idx !== -1) toggleSection(idx);
+  });
+  $('sectionsContainer').addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    var header = e.target.closest('.section-header');
+    if (!header) return; e.preventDefault(); header.click();
+  });
+  $('tocGrid').addEventListener('click', function(e) {
+    var item = e.target.closest('.toc-item');
+    if (!item) return;
+    var idx = parseInt(item.dataset.idx, 10);
+    if (!isNaN(idx)) openSectionFromTOC(idx);
+  });
+  $('tocGrid').addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    var item = e.target.closest('.toc-item');
+    if (!item) return; e.preventDefault(); item.click();
+  });
+}
+
+function buildTOC() {
+  $('tocGrid').innerHTML = SECTION_TITLES.map(function(s, i) {
+    return '<div class="toc-item" data-idx="' + i + '" role="button" tabindex="0" aria-label="Section ' + s.num + '">' +
+      '<div class="toc-num">' + s.num + '</div>' +
+      '<div class="toc-label"><span class="en">' + s.titleEn + '</span><span class="ar">' + s.titleAr + '</span></div></div>';
+  }).join('');
+}
+
+function buildSidebar() {
+  var nav = $('sidebarNav');
+  nav.innerHTML = SECTION_TITLES.map(function(s, i) {
+    return '<a class="sidebar-link" href="#' + s.id + '" data-idx="' + i + '" role="menuitem">' +
+      '<div class="sidebar-link-num">' + s.num + '</div>' +
+      '<span class="en">' + s.titleEn + '</span><span class="ar">' + s.titleAr + '</span></a>';
+  }).join('');
+  nav.querySelectorAll('.sidebar-link').forEach(function(link) {
+    link.addEventListener('click', function(e) {
+      e.preventDefault();
+      var idx = parseInt(link.dataset.idx, 10);
+      closeSidebar();
+      setTimeout(function() { openSectionFromTOC(idx); }, 50);
+    });
+  });
+}
+
+function buildSections() {
+  $('sectionsContainer').innerHTML = SECTIONS.map(function(s, i) {
+    return '<div class="section reveal" id="' + s.id + '">' +
+      '<div class="section-header" role="button" tabindex="0" aria-expanded="false" aria-controls="b' + i + '">' +
+      '<div class="section-num">' + s.num + '</div>' +
+      '<div class="section-title"><span class="en">' + s.titleEn + '</span><span class="ar">' + s.titleAr + '</span></div>' +
+      '<div class="section-arrow">›</div>' +
+      '</div>' +
+      '<div class="section-body" id="b' + i + '"><div class="section-body-inner"><div class="section-content">' + s.content + '</div></div></div>' +
+      '</div>';
+  }).join('');
+}
+
+function toggleSection(idx) {
+  var section = document.getElementById(SECTIONS[idx].id);
+  if (!section) return;
+  var header = section.querySelector('.section-header');
+  var body = section.querySelector('.section-body');
+  var arrow = section.querySelector('.section-arrow');
+  var isOpen = body.classList.contains('open');
+
+  if (isOpen) {
+    body.classList.remove('open');
+    header.classList.remove('active');
+    header.setAttribute('aria-expanded', 'false');
+    arrow.classList.remove('open');
+  } else {
+    body.classList.add('open');
+    header.classList.add('active');
+    header.setAttribute('aria-expanded', 'true');
+    arrow.classList.add('open');
+    setTimeout(function() {
+      section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 100);
+  }
+  updateCollapseBtn();
+}
+
+function openSectionFromTOC(idx) {
+  var section = document.getElementById(SECTIONS[idx].id);
+  if (!section) return;
+  var body = section.querySelector('.section-body');
+  if (!body.classList.contains('open')) toggleSection(idx);
+  setTimeout(function() {
+    var header = section.querySelector('.section-header');
+    var headerRect = header.getBoundingClientRect();
+    var scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+    var offset = 80;
+    var targetY = scrollTop + headerRect.top - offset;
+    window.scrollTo({ top: targetY, behavior: 'smooth' });
+  }, 100);
+}
+window.openSectionFromTOC = openSectionFromTOC;
+
+function toggleAllSections() {
+  allExpanded = !allExpanded;
+  SECTIONS.forEach(function(s, i) {
+    var body = document.getElementById('b' + i);
+    var header = document.getElementById(s.id).querySelector('.section-header');
+    var arrow = document.getElementById(s.id).querySelector('.section-arrow');
+    if (allExpanded) {
+      body.classList.add('open');
+      header.classList.add('active');
+      header.setAttribute('aria-expanded', 'true');
+      arrow.classList.add('open');
+    } else {
+      body.classList.remove('open');
+      header.classList.remove('active');
+      header.setAttribute('aria-expanded', 'false');
+      arrow.classList.remove('open');
+    }
+  });
+  updateCollapseBtn();
+}
+
+function updateCollapseBtn() {
+  var btn = $('collapseToggle');
+  var anyOpen = SECTIONS.some(function(s) {
+    return document.getElementById('b' + SECTIONS.indexOf(s)).classList.contains('open');
+  });
+  btn.querySelector('.en').textContent = anyOpen ? 'Collapse All' : 'Expand All';
+  btn.querySelector('.ar').textContent = anyOpen ? 'طي الكل' : 'توسيع الكل';
+}
+
+function initScrollReveal() {
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+  document.querySelectorAll('.reveal').forEach(function(el) { observer.observe(el); });
+}
+
+function initScrollHandler() {
+  var lastScroll = 0;
+  window.addEventListener('scroll', function() {
+    var scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+    var backToTop = $('backToTop');
+    var progress = $('readingProgress');
+
+    if (scrollTop > 400) backToTop.classList.add('visible');
+    else backToTop.classList.remove('visible');
+
+    var docHeight = document.documentElement.scrollHeight - window.innerHeight;
+    var scrollPercent = docHeight > 0 ? (scrollTop / docHeight) * 100 : 0;
+    progress.style.width = scrollPercent + '%';
+
+    lastScroll = scrollTop;
+  }, { passive: true });
+}
+
+function initSidebarActiveLink() {
+  var observer = new IntersectionObserver(function(entries) {
+    entries.forEach(function(entry) {
+      if (entry.isIntersecting) {
+        var id = entry.target.id;
+        document.querySelectorAll('.sidebar-link').forEach(function(link) {
+          link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+        });
+      }
+    });
+  }, { threshold: 0.3, rootMargin: '-80px 0px -60% 0px' });
+  SECTIONS.forEach(function(s) {
+    var el = document.getElementById(s.id);
+    if (el) observer.observe(el);
+  });
+}
+
+function initCopyButtons() {
+  document.querySelectorAll('.copy-btn').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var block = btn.closest('.code-block');
+      if (!block) return;
+      var clone = block.cloneNode(true);
+      clone.querySelectorAll('.code-label, .copy-btn').forEach(function(e) { e.remove(); });
+      copyText(clone.innerText.trim(), btn);
+    });
+  });
+}
+
+function copyText(text, btn) {
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function() { showCopySuccess(btn); }).catch(function() { fallbackCopy(text, btn); });
+  else fallbackCopy(text, btn);
+}
+
+function fallbackCopy(text, btn) {
+  var ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); showCopySuccess(btn); } catch(e) { showToast('Copy failed'); }
+  document.body.removeChild(ta);
+}
+
+function showCopySuccess(btn) {
+  if (!btn) return;
+  btn.classList.add('copied');
+  btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#30D158" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>';
+  showToast(currentLang === 'ar' ? 'تم النسخ!' : 'Copied!');
+  setTimeout(function() {
+    btn.classList.remove('copied');
+    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  }, 2000);
+}
+
+function initSearch() {
+  var input = $('searchInput'), results = $('searchResults');
+  if (!input || !results) return;
+  var idx = SECTIONS.map(function(s, i) {
+    var tmp = document.createElement('div'); tmp.innerHTML = s.content;
+    return { i: i, titleEn: s.titleEn, titleAr: s.titleAr, text: tmp.textContent.substring(0, 2000) };
+  });
+  input.addEventListener('input', function() {
+    var q = input.value.trim().toLowerCase();
+    if (q.length < 2) { results.classList.remove('active'); return; }
+    var hits = idx.filter(function(s) {
+      return s.titleEn.toLowerCase().indexOf(q) !== -1 || s.titleAr.indexOf(q) !== -1 || s.text.toLowerCase().indexOf(q) !== -1;
+    }).slice(0, 8);
+    results.innerHTML = hits.length === 0
+      ? '<div class="search-result-item" style="color:var(--text-muted)">' + (currentLang === 'ar' ? 'لا توجد نتائج' : 'No results') + '</div>'
+      : hits.map(function(m) {
+        var title = currentLang === 'ar' ? m.titleAr : m.titleEn;
+        var highlighted = highlightMatch(title, q);
+        return '<div class="search-result-item" data-idx="' + m.i + '">' + highlighted + '</div>';
+      }).join('');
+    results.classList.add('active');
+  });
+  results.addEventListener('click', function(e) {
+    var item = e.target.closest('.search-result-item');
+    if (!item || !item.dataset.idx) return;
+    openSectionFromTOC(parseInt(item.dataset.idx));
+    results.classList.remove('active'); input.value = ''; input.blur();
+  });
+  input.addEventListener('blur', function() { setTimeout(function() { results.classList.remove('active'); }, 200); });
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { var first = results.querySelector('.search-result-item[data-idx]'); if (first) first.click(); }
+  });
+}
+
+function highlightMatch(text, query) {
+  if (!query) return text;
+  var lower = text.toLowerCase(), idx = lower.indexOf(query);
+  if (idx === -1) return text;
+  return text.substring(0, idx) + '<span class="search-highlight">' + text.substring(idx, idx + query.length) + '</span>' + text.substring(idx + query.length);
+}
+
+function showToast(msg) { toastQueue.push(msg); if (!toastShowing) processToastQueue(); }
+
+function processToastQueue() {
+  if (toastQueue.length === 0) { toastShowing = false; return; }
+  toastShowing = true; var msg = toastQueue.shift(), container = $('toastContainer');
+  if (!container) return;
+  var t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
+  container.appendChild(t); t.offsetHeight; t.classList.add('visible');
+  setTimeout(function() { t.classList.remove('visible'); setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); processToastQueue(); }, 400); }, 2200);
+}
+
+function initKeyboardShortcuts() {
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      closeSidebar(); var sr = $('searchResults'), si = $('searchInput');
+      if (sr) sr.classList.remove('active'); if (si) { si.value = ''; si.blur(); }
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); var si2 = $('searchInput'); if (si2) si2.focus(); }
+  });
+}
+
+// ===== THEME =====
+function applyTheme() {
+  var html = document.documentElement;
+  html.removeAttribute('data-theme');
+  if (currentTheme === 'oled') html.setAttribute('data-theme', 'oled');
+  else if (currentTheme === 'light') html.setAttribute('data-theme', 'light');
+  else if (currentTheme === 'soft') html.setAttribute('data-theme', 'soft');
+  updateThemeLabel();
+}
+
+function cycleTheme() {
+  var themes = ['soft', 'oled', 'light'];
+  var idx = themes.indexOf(currentTheme);
+  currentTheme = themes[(idx + 1) % themes.length];
+  localStorage.setItem('ytGuideTheme', currentTheme);
+  applyTheme();
+}
+
+function updateThemeLabel() {
+  var label = $('themeLabel');
+  if (!label) return;
+  var labels = { soft: 'Dark', oled: 'OLED', light: 'Light' };
+  label.textContent = labels[currentTheme] || 'Dark';
+}
+
+// ===== LANGUAGE =====
+function toggleLang() {
+  currentLang = currentLang === 'en' ? 'ar' : 'en';
+  localStorage.setItem('ytGuideLang', currentLang);
+  document.documentElement.lang = currentLang;
+  document.documentElement.dir = currentLang === 'ar' ? 'rtl' : 'ltr';
+  document.documentElement.classList.toggle('lang-ar', currentLang === 'ar');
+  updateLangBtn();
+}
+
+function updateLangBtn() {
+  var indicator = $('langIndicator');
+  if (!indicator) return;
+  indicator.querySelector('.lang-current').textContent = currentLang === 'en' ? 'EN' : 'عربي';
+  indicator.querySelector('.lang-target').textContent = currentLang === 'en' ? 'عربي' : 'EN';
+}
+
+// ===== SIDEBAR =====
+function toggleSidebar() {
+  $('sidebar').classList.toggle('active');
+  $('sidebarOverlay').classList.toggle('active');
+  document.body.style.overflow = $('sidebar').classList.contains('active') ? 'hidden' : '';
+}
+
+function closeSidebar() {
+  $('sidebar').classList.remove('active');
+  $('sidebarOverlay').classList.remove('active');
+  document.body.style.overflow = '';
+}
+
+// ===== DOWNLOAD SCRIPTS =====
+var SCRIPT_CONTENT = {};
+
+function initDownloadButtons() {
+  document.querySelectorAll('.download-btn').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+      e.preventDefault();
+      var filename = btn.dataset.file;
+      downloadScript(filename);
+    });
+  });
+}
+
+function downloadScript(filename) {
+  var code = getScriptCode(filename);
+  if (!code) return;
+  var blob = new Blob([code], { type: 'text/plain' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast(currentLang === 'ar' ? 'تم التحميل!' : 'Downloaded!');
+}
+
+function getScriptCode(filename) {
+  if (filename === 'pipeline.py') {
+    return 'import os\nimport sys\nimport time\nimport shutil\nimport logging\nimport subprocess\n\n# ════════════════════════════════════════════════\n#  PIPELINE DEFAULTS\n# ════════════════════════════════════════════════\nDEFAULT_SRC_LANG     = "ja"\nDEFAULT_MODEL        = "small"\nDEFAULT_DEVICE       = "cuda"\nDEFAULT_COMPUTE      = "float16"\nDEFAULT_BEAM         = 5\nDEFAULT_TEMP         = 0.4\nDEFAULT_VAD          = True\nDEFAULT_COND         = False\nMIN_FILE_SIZE        = 1 * 1024 * 1024\n\nDEFAULT_TGT_LANG     = "Arabic"\nDEFAULT_TGT_EXT      = "ar"\nDEFAULT_API_KEY      = ""\nDEFAULT_RETRIES      = 3\nDEFAULT_RETRY_WAIT   = 10\n\nLOGS_FOLDER          = "logs"\n# ════════════════════════════════════════════════\n\nLANG_EXT_MAP = {\n    "arabic":"ar","english":"en","japanese":"ja","korean":"ko",\n    "french":"fr","german":"de","spanish":"es","chinese":"zh",\n    "turkish":"tr","italian":"it","portuguese":"pt","russian":"ru",\n    "dutch":"nl","polish":"pl","hindi":"hi","persian":"fa",\n    "thai":"th","vietnamese":"vi","indonesian":"id","malay":"ms",\n}\n\n# ── HELPERS ──────────────────────────────────────────────────\ndef ask(prompt, default=""):\n    val = input(prompt).strip()\n    return val if val else default\n\ndef yn(prompt, default_yes=True):\n    hint = "[Y/n]" if default_yes else "[y/N]"\n    val = input(f"  {prompt} {hint}: ").strip().lower()\n    return default_yes if not val else val == "y"\n\ndef fmt_time(s):\n    m, s = divmod(int(s), 60)\n    h, m = divmod(m, 60)\n    if h: return f"{h}h {m}m {s}s"\n    elif m: return f"{m}m {s}s"\n    return f"{s}s"\n\ndef fmt_srt(t):\n    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60\n    return f"{h:02}:{m:02}:{s:06.3f}".replace(".", ",")\n\ndef fmt_size(b):\n    for u in ["B","KB","MB","GB"]:\n        if b < 1024: return f"{b:.1f} {u}"\n        b /= 1024\n    return f"{b:.1f} TB"\n\ndef derive_ext(lang):\n    return LANG_EXT_MAP.get(lang.lower().strip(), lang[:2].lower())\n\ndef is_valid_srt(path):\n    try: return os.path.exists(path) and os.path.getsize(path) > 50\n    except: return False\n\ndef is_utf8(path):\n    try:\n        with open(path, "r", encoding="utf-8") as f: f.read()\n        return True\n    except: return False\n\ndef check_cuda():\n    try:\n        import torch\n        return torch.cuda.is_available()\n    except: return False\n\ndef is_file_ready(path):\n    try:\n        s1 = os.path.getsize(path); time.sleep(0.5); s2 = os.path.getsize(path)\n        return s1 == s2 and s1 >= MIN_FILE_SIZE\n    except: return False\n\ndef safe_base(filename, suffix):\n    if filename.lower().endswith(suffix.lower()):\n        base = filename[: -len(suffix)]\n        if base.endswith(f".{suffix.split(\'.\')[1]}"):\n            return None\n        return base\n    return None\n\ndef check_ffmpeg_mov_text():\n    if not shutil.which("ffmpeg"): return False\n    r = subprocess.run(["ffmpeg", "-codecs"], capture_output=True, text=True)\n    return "mov_text" in r.stdout\n\n# ─────────────────────────────────────────────────────────────\nprint()\nprint("╔══════════════════════════════════════════════╗")\nprint("║   Transcribe → Translate → Remux Pipeline    ║")\nprint("║   v3.0 · Whisper + gst + ffmpeg              ║")\nprint("╚══════════════════════════════════════════════╝")\nprint()\n\n# ── CHECK TOOLS ──────────────────────────────────────────────\ngst_ok   = shutil.which("gst") is not None\nffmpeg_ok = check_ffmpeg_mov_text()\n\nif not gst_ok:\n    print("  [!] \'gst\' not found — translate step unavailable.")\nif not ffmpeg_ok:\n    print("  [!] \'ffmpeg\' not found or missing mov_text — remux step unavailable.")\n\n# ── SETUP ────────────────────────────────────────────────────\nFOLDER   = os.path.dirname(os.path.abspath(__file__))\nSRC_LANG = DEFAULT_SRC_LANG\nMODEL    = DEFAULT_MODEL\nDEVICE   = DEFAULT_DEVICE\nCOMPUTE  = DEFAULT_COMPUTE\nTGT_LANG = DEFAULT_TGT_LANG\nTGT_EXT  = DEFAULT_TGT_EXT\nAPI_KEY  = DEFAULT_API_KEY\nRETRIES  = DEFAULT_RETRIES\nDO_TRANS = True\nDO_XLATE = gst_ok\nDO_REMUX = ffmpeg_ok\n\nprint("  Answer a few questions — then it runs fully unattended.")\nprint()\n\n# Folder\nprint("  Video folder (Enter = script folder):")\ncustom = ask(f"  [{FOLDER}]: ", "")\nif custom and os.path.isdir(custom):\n    FOLDER = custom\nelif custom:\n    print("  [!] Folder not found — using script folder.")\n\n# Source language\nprint()\nSRC_LANG = ask(f"  Transcribe FROM language (Enter = {DEFAULT_SRC_LANG}): ", DEFAULT_SRC_LANG)\n\n# Target language\nprint()\ntgt_input = ask(f"  Translate TO language (Enter = {DEFAULT_TGT_LANG}): ", "").strip()\nif tgt_input:\n    TGT_LANG = tgt_input\n    derived  = derive_ext(tgt_input)\n    TGT_EXT  = ask(f"  Output extension (derived: {derived} — Enter to confirm or correct): ", derived)\nelse:\n    TGT_LANG = DEFAULT_TGT_LANG\n    TGT_EXT  = DEFAULT_TGT_EXT\n\n# Steps\nprint()\nDO_TRANS = yn("Step 1 — Transcribe videos?")\nif gst_ok:\n    DO_XLATE = yn("Step 2 — Translate SRTs?")\nelse:\n    DO_XLATE = False\nif ffmpeg_ok:\n    DO_REMUX = yn("Step 3 — Soft remux translations into videos?")\nelse:\n    DO_REMUX = False\n\nif not DO_TRANS and not DO_XLATE and not DO_REMUX:\n    print("\\n  Nothing to do — all steps disabled. Exiting.")\n    input("\\n  Press Enter to exit...")\n    sys.exit()\n\n# Advanced\nprint()\nprint("  [0]  Use all other defaults and start")\nprint("  [1]  Change model / device / API key")\nprint()\nmode = ask("  Enter 0 or 1 [0]: ", "0")\n\ncuda_available = check_cuda()\n\nif mode == "1":\n    if DO_TRANS:\n        print()\n        print("  Model: tiny/base/small/medium/large-v3-turbo/large-v3")\n        MODEL = ask(f"  [{DEFAULT_MODEL}]: ", DEFAULT_MODEL)\n        print()\n        if cuda_available:\n            DEVICE  = ask(f"  Device cuda/cpu [{DEFAULT_DEVICE}]: ", DEFAULT_DEVICE)\n            COMPUTE = ask(f"  Compute float16/int8 [{DEFAULT_COMPUTE}]: ", DEFAULT_COMPUTE)\n        else:\n            print("  [!] CUDA not available — using CPU/int8.")\n            DEVICE = "cpu"; COMPUTE = "int8"\n    if DO_XLATE:\n        print()\n        key_in = ask("  Gemini API key (Enter = use default): ", "")\n        if key_in: API_KEY = key_in\n        retry_in = ask(f"  Retries on failure [{DEFAULT_RETRIES}]: ", str(DEFAULT_RETRIES))\n        RETRIES = int(retry_in) if retry_in.isdigit() else DEFAULT_RETRIES\nelse:\n    if DO_TRANS and DEVICE == "cuda" and not cuda_available:\n        print("  [!] CUDA not available — switching to CPU/int8.")\n        DEVICE = "cpu"; COMPUTE = "int8"\n\nsrc_suffix  = f".{SRC_LANG}.srt"\ntgt_suffix  = f".{TGT_EXT}.srt"\nremux_dir   = os.path.join(FOLDER, f"muxed_{TGT_EXT}")\n\n# ── SETUP LOGS FOLDER ────────────────────────────────────────\nlogs_dir = os.path.join(FOLDER, LOGS_FOLDER)\nos.makedirs(logs_dir, exist_ok=True)\ntimestamp = time.strftime("%Y%m%d_%H%M%S")\nLOG_FILE  = os.path.join(logs_dir, f"pipeline_{timestamp}.txt")\n\nlogger = logging.getLogger("pipeline")\nlogger.setLevel(logging.INFO)\nfh = logging.FileHandler(LOG_FILE, encoding="utf-8")\nfh.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))\nlogger.addHandler(fh)\n\ndef log(msg):\n    print(msg)\n    logger.info(msg)\n\ndef log_only(msg):\n    logger.info(msg)\n\ndef section(title):\n    print()\n    print(f"  ┌─ {title} {\'─\' * max(1, 42 - len(title))}┐")\n    log_only(f"\\n{\'─\'*50}\\n  {title}\\n{\'─\'*50}")\n\n# ── PRE-SCAN ─────────────────────────────────────────────────\nvid_files = [\n    f for f in os.listdir(FOLDER)\n    if f.lower().endswith((".mkv", ".mp4", ".webm"))\n    and os.path.isfile(os.path.join(FOLDER, f))\n]\nsrt_files = [f for f in os.listdir(FOLDER) if f.lower().endswith(src_suffix)]\n\nsteps_str = "  ".join(filter(None, [\n    "Transcribe" if DO_TRANS else None,\n    f"Translate→{TGT_LANG}" if DO_XLATE else None,\n    "Remux" if DO_REMUX else None,\n]))\n\n# ── CONFIRM ──────────────────────────────────────────────────\nprint()\nprint("╔══════════════════════════════════════════════╗")\nprint("║  Pipeline Ready — will run unattended        ║")\nprint("╠══════════════════════════════════════════════╣")\nprint(f"║  Folder   : {FOLDER}")\nprint(f"║  Steps    : {steps_str}")\nprint(f"║  From     : {SRC_LANG}  |  To: {TGT_LANG} (*.{TGT_EXT}.srt)")\nif DO_REMUX:\n    print(f"║  Remux →  : muxed_{TGT_EXT}\\\\")\nprint(f"║  Videos   : {len(vid_files)}  |  SRTs: {len(srt_files)}")\nprint(f"║  Log      : logs\\\\pipeline_{timestamp}.txt")\nprint("╚══════════════════════════════════════════════╝")\nprint()\nif not yn("Start pipeline?"):\n    print("  Aborted.")\n    log_only("Session aborted by user.")\n    input("\\n  Press Enter to exit...")\n    sys.exit()\n\nlog_only(f"{\'═\'*50}")\nlog_only(f"SESSION START  {time.strftime(\'%Y-%m-%d %H:%M:%S\')}")\nlog_only(f"folder={FOLDER}  src={SRC_LANG}  tgt={TGT_LANG}({TGT_EXT})  model={MODEL}  device={DEVICE}")\nlog_only(f"steps: trans={DO_TRANS} xlate={DO_XLATE} remux={DO_REMUX}")\nlog_only(f"{\'═\'*50}")\n\nsession_start = time.time()\n\n# ═════════════════════════════════════════════════════════════\n#  STEP 1 — TRANSCRIBE\n# ═════════════════════════════════════════════════════════════\nt_done = t_skipped = t_failed = t_partial = 0\n\nif DO_TRANS:\n    section("STEP 1 — TRANSCRIBING")\n\n    all_videos   = [os.path.join(FOLDER, f) for f in vid_files]\n    ready_videos = [fp for fp in all_videos if is_file_ready(fp)]\n    partial      = [fp for fp in all_videos if fp not in ready_videos]\n\n    for fp in partial:\n        log(f"  [!] Partial/incomplete — skipped: {os.path.basename(fp)}")\n        t_partial += 1\n\n    if not ready_videos:\n        log("  [!] No ready video files found.")\n    else:\n        log(f"  {len(ready_videos)} video(s) ready — loading model \'{MODEL}\'...")\n        model = None\n        try:\n            from faster_whisper import WhisperModel\n            model = WhisperModel(MODEL, device=DEVICE, compute_type=COMPUTE)\n            log(f"  Model ready on {DEVICE} ({COMPUTE}).")\n        except Exception as e:\n            log(f"  [FAIL] Model load failed: {e}")\n            log(f"  [!] Transcribe aborted — translate will run on existing SRTs.")\n            t_failed += len(ready_videos)\n\n        if model:\n            step_start = time.time()\n            for i, video_path in enumerate(ready_videos, 1):\n                name      = os.path.splitext(os.path.basename(video_path))[0]\n                srt_path  = os.path.join(FOLDER, f"{name}.{SRC_LANG}.srt")\n                lock_path = srt_path + ".lock"\n\n                if is_valid_srt(srt_path):\n                    log(f"  [SKIP] {name}")\n                    t_skipped += 1\n                    continue\n                if os.path.exists(lock_path):\n                    log(f"  [SKIP] {name}  (locked)")\n                    t_skipped += 1\n                    continue\n\n                log(f"  [{i}/{len(ready_videos)}] {name}")\n                open(lock_path, "w").close()\n                t0 = time.time()\n                try:\n                    segments, info = model.transcribe(\n                        video_path, language=SRC_LANG,\n                        beam_size=DEFAULT_BEAM, vad_filter=DEFAULT_VAD,\n                        condition_on_previous_text=DEFAULT_COND,\n                        temperature=DEFAULT_TEMP,\n                    )\n                    if hasattr(info, \'language_probability\'):\n                        detected = getattr(info, \'language\', SRC_LANG)\n                        prob = info.language_probability\n                        if detected != SRC_LANG:\n                            log(f"  [!] Lang mismatch: expected {SRC_LANG}, got {detected} ({prob:.0%})")\n\n                    count = 0\n                    with open(srt_path, "w", encoding="utf-8-sig") as f:\n                        for idx, seg in enumerate(segments, 1):\n                            text = seg.text.strip()\n                            if not text: continue\n                            f.write(f"{idx}\\n{fmt_srt(seg.start)} --> {fmt_srt(seg.end)}\\n{text}\\n\\n")\n                            count = idx\n\n                    elapsed = fmt_time(time.time() - t0)\n                    if count == 0:\n                        log(f"  [!] WARNING: 0 segments for {name}")\n                    else:\n                        log(f"  [✓] {name}  {count} segments  ({elapsed})")\n                    t_done += 1\n\n                except Exception as e:\n                    log(f"  [✗] FAILED {name}: {e}")\n                    if os.path.exists(srt_path):\n                        try: os.remove(srt_path)\n                        except: pass\n                    t_failed += 1\n                finally:\n                    if os.path.exists(lock_path):\n                        try: os.remove(lock_path)\n                        except: pass\n\n            log(f"\\n  Transcribe: ✓{t_done}  →{t_skipped}  ✗{t_failed}  ⚠{t_partial}  ({fmt_time(time.time()-step_start)})")\n\n# ═════════════════════════════════════════════════════════════\n#  STEP 2 — TRANSLATE\n# ═════════════════════════════════════════════════════════════\nx_done = x_skipped = x_failed = 0\n\nif DO_XLATE:\n    section("STEP 2 — TRANSLATING")\n\n    seen_bases = set()\n    xlate_files = []\n    for f in sorted(os.listdir(FOLDER)):\n        if not f.lower().endswith(src_suffix): continue\n        base = safe_base(f, src_suffix)\n        if base is None:\n            log(f"  [!] Malformed filename skipped: {f}"); continue\n        if base in seen_bases:\n            log(f"  [!] Duplicate skipped: {f}"); continue\n        seen_bases.add(base)\n        src_path = os.path.join(FOLDER, f)\n        tgt_path = os.path.join(FOLDER, f"{base}{tgt_suffix}")\n        if is_valid_srt(tgt_path):\n            x_skipped += 1; continue\n        if not is_valid_srt(src_path) or not is_utf8(src_path):\n            log(f"  [!] Invalid/non-UTF8 SRT skipped: {f}"); continue\n        xlate_files.append((src_path, tgt_path, base))\n\n    if not xlate_files:\n        log(f"  [!] No SRTs to translate  ({x_skipped} already done).")\n    else:\n        log(f"  {len(xlate_files)} SRT(s) to translate...")\n        step_start = time.time()\n        for i, (src_path, tgt_path, base) in enumerate(xlate_files, 1):\n            log(f"  [{i}/{len(xlate_files)}] {base}")\n            t0 = time.time()\n            success = False\n            for attempt in range(1, RETRIES + 1):\n                result = subprocess.run(\n                    ["gst", "translate", "-i", src_path, "-o", tgt_path,\n                     "-l", TGT_LANG, "-k", API_KEY],\n                )\n                if result.returncode == 0 and is_valid_srt(tgt_path):\n                    success = True; break\n                if attempt < RETRIES:\n                    wait = DEFAULT_RETRY_WAIT * attempt\n                    log(f"  [!] Attempt {attempt} failed — retry in {wait}s...")\n                    time.sleep(wait)\n                else:\n                    if os.path.exists(tgt_path) and not is_valid_srt(tgt_path):\n                        try: os.remove(tgt_path)\n                        except: pass\n\n            elapsed = fmt_time(time.time() - t0)\n            if success:\n                log(f"  [✓] {base}  ({elapsed})"); x_done += 1\n            else:\n                log(f"  [✗] FAILED {base} after {RETRIES} attempts"); x_failed += 1\n\n        log(f"\\n  Translate: ✓{x_done}  →{x_skipped}  ✗{x_failed}  ({fmt_time(time.time()-step_start)})")\n\n# ═════════════════════════════════════════════════════════════\n#  STEP 3 — SOFT REMUX\n# ═════════════════════════════════════════════════════════════\nr_done = r_skipped = r_failed = 0\n\nif DO_REMUX:\n    section("STEP 3 — SOFT REMUXING")\n    os.makedirs(remux_dir, exist_ok=True)\n\n    vid_exts = (".mp4", ".mkv", ".avi", ".mov", ".webm")\n    seen_bases = set()\n    remux_files = []\n\n    for f in os.listdir(FOLDER):\n        fpath = os.path.join(FOLDER, f)\n        if not os.path.isfile(fpath): continue\n        if not f.lower().endswith(vid_exts): continue\n        base = os.path.splitext(f)[0]\n        if base in seen_bases:\n            log(f"  [!] Duplicate base skipped: {f}"); continue\n        seen_bases.add(base)\n\n        srt_path = os.path.join(FOLDER, f"{base}{tgt_suffix}")\n        out_path = os.path.join(remux_dir, f"{base}.mp4")\n\n        if not is_valid_srt(srt_path):\n            log(f"  [SKIP] {f}  (no {tgt_suffix} found)")\n            r_skipped += 1; continue\n        if not is_utf8(srt_path):\n            log(f"  [SKIP] {f}  (SRT not valid UTF-8)")\n            r_skipped += 1; continue\n        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:\n            log(f"  [SKIP] {f}  (output exists)")\n            r_skipped += 1; continue\n\n        remux_files.append((fpath, srt_path, out_path, base))\n\n    if not remux_files:\n        log(f"  [!] No videos to remux  ({r_skipped} skipped).")\n    else:\n        log(f"  {len(remux_files)} video(s) to remux...")\n        step_start = time.time()\n        for i, (video_path, srt_path, out_path, base) in enumerate(remux_files, 1):\n            log(f"  [{i}/{len(remux_files)}] {base}")\n            orig_size = os.path.getsize(video_path)\n\n            cmd = [\n                "ffmpeg",\n                "-i", video_path,\n                "-i", srt_path,\n                "-map", "0",\n                "-map", "1",\n                "-c", "copy",\n                "-c:s", "mov_text",\n                "-metadata:s:s:0", f"language={TGT_EXT}",\n                "-y", out_path,\n                "-loglevel", "error",\n            ]\n            result = subprocess.run(cmd, capture_output=True, text=True)\n\n            if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:\n                out_size = os.path.getsize(out_path)\n                diff = ((out_size - orig_size) / orig_size) * 100\n                sign = "+" if diff >= 0 else ""\n                log(f"  [✓] {base}  {fmt_size(orig_size)} → {fmt_size(out_size)} ({sign}{diff:.1f}%)")\n                r_done += 1\n            else:\n                err = result.stderr.strip() if result.stderr else "(no error output)"\n                log(f"  [✗] FAILED {base}: {err}")\n                if os.path.exists(out_path):\n                    try: os.remove(out_path)\n                    except: pass\n                r_failed += 1\n\n        log(f"\\n  Remux: ✓{r_done}  →{r_skipped}  ✗{r_failed}  ({fmt_time(time.time()-step_start)})")\n\n# ── FINAL REPORT ─────────────────────────────────────────────\ntotal_elapsed = fmt_time(time.time() - session_start)\nprint()\nprint("╔══════════════════════════════════════════════╗")\nprint("║  Pipeline Complete                           ║")\nprint("╠══════════════════════════════════════════════╣")\nif DO_TRANS:\n    print(f"║  Transcribe  ✓{t_done}  →{t_skipped}  ✗{t_failed}  ⚠partial:{t_partial}")\nif DO_XLATE:\n    print(f"║  Translate   ✓{x_done}  →{x_skipped}  ✗{x_failed}")\nif DO_REMUX:\n    print(f"║  Remux       ✓{r_done}  →{r_skipped}  ✗{r_failed}")\nprint(f"║  ⏱ Total     : {total_elapsed}")\nprint(f"║  📄 Log      : logs\\\\pipeline_{timestamp}.txt")\nprint("╚══════════════════════════════════════════════╝")\nprint()\nlog_only(f"\\nSESSION END  {time.strftime(\'%Y-%m-%d %H:%M:%S\')}  total={total_elapsed}")\nlog_only(f"{\'═\'*50}\\n")\ninput("  Press Enter to exit...")';
+  } else if (filename === 'pipeline.bat') {
+    return '@echo off\npython "%~dp0%~n0.py"\npause';
+  }
+  return '';
+}
+
+})();
+</script>
+</body>
+</html>
