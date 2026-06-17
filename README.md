@@ -45,3 +45,27 @@ To run this pipeline from source, you will need:
    ```bash
    git clone https://github.com/BMQ-1/subs-pipeline.git
    cd subs-pipeline
+
+---
+
+1. Create a virtual environment and activate it:
+
+python -m venv venv
+
+# Windows activation:
+venv\Scripts\activate
+# macOS/Linux activation:
+source venv/bin/activate
+
+
+2. Install the dependencies:
+
+pip install -r requirements.txt
+
+
+3. Run the application:
+
+python subs-pipeline.py
+
+---
+
