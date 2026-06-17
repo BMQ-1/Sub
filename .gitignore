@@ -1,0 +1,28 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual Environments
+venv/
+ENV/
+env/
+
+# Build and PyInstaller output directories
+build/
+dist/
+*.spec
+
+# Local application settings (contains your private API key)
+subs_pipeline_settings.json
+subs_pipeline_settings.json.tmp
+
+# Standalone FFmpeg binaries downloaded locally
+ffmpeg.exe
+ffprobe.exe
+ffmpeg_temp.zip
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
