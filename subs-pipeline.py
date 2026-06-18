@@ -12,6 +12,8 @@ import platform
 import tempfile
 import threading
 import subprocess
+import gzip
+import ssl
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -22,6 +24,17 @@ import random
 import contextlib
 from pathlib import Path
 from typing import Any, Optional, Union, Tuple, List, Dict, Set, Generator
+
+# ── Dynamic OpenMP and SSL Environment Overrides ──────────────────
+# Prevents crashes when duplicate OpenMP runtimes are loaded in the same process
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Ensure frozen executables find SSL certificates for API requests
+try:
+    import certifi
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+except ImportError:
+    pass
 
 # ── Module Level Declarations ───────────────────────────
 __all__ = [
@@ -105,7 +118,7 @@ def enable_windows_ansi() -> None:
 # ════════════════════════════════════════════════════════════
 #  MODULE METADATA
 # ════════════════════════════════════════════════════════════
-__version__ = "1.1"
+__version__ = "1.2"
 __author__ = "Subs Pipeline Team"
 
 # ════════════════════════════════════════════════════════════
@@ -225,6 +238,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "src_lang": "",
     "min_blocks": 3,
     "model": "small",
+    "device": "auto",
     "skip_cleanup": False,
     "skip_migration": False,
     "explain_summary": True,
@@ -244,7 +258,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 FALLBACK_MODELS: Dict[str, str] = {
     "gemini": "gemini-3.5-flash",
     "openai": "gpt-4o-mini",
-    "anthropic": "claude-4.5-haiku-latest",
+    "anthropic": "claude-haiku-4-5",
 }
 
 # Unified Box-Drawing Constants
@@ -413,9 +427,19 @@ def check_dependencies(headless: bool = False) -> None:
 
 
 def setup_ffmpeg() -> bool:
-    """Locate ffmpeg and ffprobe executables in system PATH."""
+    """Locate ffmpeg and ffprobe executables in system PATH or program directory."""
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
+    
+    # Fallback to local program folder directory to assist portable distributions
+    if not ffmpeg or not ffprobe:
+        ext = ".exe" if platform.system() == "Windows" else ""
+        local_ffmpeg = APP_DIR / f"ffmpeg{ext}"
+        local_ffprobe = APP_DIR / f"ffprobe{ext}"
+        if local_ffmpeg.exists() and local_ffprobe.exists():
+            ffmpeg = str(local_ffmpeg)
+            ffprobe = str(local_ffprobe)
+
     if ffmpeg and ffprobe:
         Context.ffmpeg_cmd = ffmpeg
         Context.ffprobe_cmd = ffprobe
@@ -492,8 +516,10 @@ def _transcribe_worker_loop(
         model = WhisperModel(model_name, device=device, compute_type=compute_type)
         res_queue.put(("init_ok", None))
     except BaseException as e:
+        import traceback
+        tb = traceback.format_exc()
         try:
-            res_queue.put(("init_error", str(e)))
+            res_queue.put(("init_error", f"{e}\n{tb}"))
         except Exception:
             pass
         return
@@ -670,12 +696,12 @@ class TranscriptionManager:
             except Exception as e:
                 logger.debug("Non-fatal termination error: %s", e)
             
-            # Close queues to avoid background thread deadlock
+            # Close queues securely without blocking on lingering background pipe threads
             for q in (cls._req_queue, cls._res_queue):
                 if q:
                     try:
+                        q.cancel_join_thread()
                         q.close()
-                        q.join_thread()
                     except Exception:
                         pass
             
@@ -1423,6 +1449,11 @@ def print_effective_settings(args: argparse.Namespace) -> None:
         f"{C.DIM}{get_src('model')} Model: {args.model.upper()}{C.RESET}"
     )
     qprint(
+        f"  Compute Device:    "
+        f"{C.CYAN}{args.device.upper():<40}{C.RESET} "
+        f"{C.DIM}{get_src('device')}{C.RESET}"
+    )
+    qprint(
         f"  Translation:       "
         f"{C.CYAN}{'Enabled' if args.translate else 'Disabled':<40}{C.RESET} "
         f"{C.DIM}{get_src('tgt_lang')} Target: {args.tgt_lang} "
@@ -1468,24 +1499,32 @@ def wait_for_file_settle(
     max_retries: int = FILE_SETTLE_MAX_RETRIES,
     delay: float = FILE_SETTLE_DELAY,
 ) -> bool:
-    """Wait for a file to stabilize (stop changing size)."""
+    """Wait for a file to stabilize (stop changing size and mtime)."""
     p = Path(path)
     if not p.exists():
         return False
 
     last_size = -1
+    last_mtime = -1.0
     for _ in range(max_retries):
         try:
-            current_size = p.stat().st_size
-            if current_size == last_size and current_size > 0:
-                try:
-                    with open(p, "rb+") as f:
-                        pass
-                except IOError:
-                    time.sleep(delay)
-                    continue
+            stat = p.stat()
+            current_size = stat.st_size
+            current_mtime = stat.st_mtime
+            
+            if current_size == last_size and current_mtime == last_mtime and current_size > 0:
+                # Perform access test on Windows to respect file sharing violations
+                if platform.system() == "Windows":
+                    try:
+                        with open(p, "rb+") as f:
+                            pass
+                    except IOError:
+                        time.sleep(delay)
+                        continue
                 return True
+            
             last_size = current_size
+            last_mtime = current_mtime
         except (IOError, OSError):
             pass
         time.sleep(delay)
@@ -1794,6 +1833,14 @@ def _execute_translator_request(
     response_text = ""
     translated_map: Dict[int, str] = {}
 
+    # Define robust SSL contexts for packaged environments
+    ssl_context = None
+    try:
+        if "certifi" in sys.modules:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+
     for attempt in range(MAX_TRANSLATION_CHUNK_RETRIES):
         headers: Dict[str, str] = {
             "Content-Type": "application/json",
@@ -1831,7 +1878,7 @@ def _execute_translator_request(
 
         elif translator == "anthropic":
             req_url = url if url else "https://api.anthropic.com/v1/messages"
-            headers["X-API-Key"] = api_key
+            headers["x-api-key"] = api_key
             headers["Anthropic-Version"] = "2023-06-01"
             payload_dict = {
                 "model": model,
@@ -1868,10 +1915,16 @@ def _execute_translator_request(
 
         try:
             req = urllib.request.Request(req_url, data=payload, headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as response:
+            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT, context=ssl_context) as response:
+                
+                # Dynamic Gzip decompression support
+                resp_bytes = response.read()
+                if response.info().get("Content-Encoding") == "gzip":
+                    resp_bytes = gzip.decompress(resp_bytes)
+                resp_decoded = resp_bytes.decode("utf-8", errors="replace")
                 
                 if translator == "google":
-                    resp_data = json.loads(response.read().decode("utf-8"))
+                    resp_data = json.loads(resp_decoded)
                     segments = resp_data[0] if resp_data and isinstance(resp_data, list) else []
                     parts_translated = []
                     if segments:
@@ -1880,14 +1933,14 @@ def _execute_translator_request(
                                 parts_translated.append(segment[0])
                     
                     stitched_translation = "".join(parts_translated)
-                    split_pattern = re.compile(r"\s*###\s*")
+                    split_pattern = re.compile(r"\s*#\s*#\s*#\s*")
                     parts = split_pattern.split(stitched_translation)
                     
                     for idx, part in enumerate(parts):
                         translated_map[idx] = part.strip()
                     success = True
                 else:
-                    resp_data = json.loads(response.read().decode("utf-8"))
+                    resp_data = json.loads(resp_decoded)
                     
                     if translator == "gemini":
                         candidates = resp_data.get("candidates", [])
@@ -1978,7 +2031,8 @@ def _parse_translation_response(response_text: str) -> Dict[int, str]:
     """Parse output text back into structured layout components mapping IDs to text."""
     parsed_translations: Dict[int, str] = {}
     if response_text.strip():
-        for part in re.split(r"Block\s*#", response_text):
+        # Clean separator split allowing flexible non-conforming responses from LLMs
+        for part in re.split(r"Block\s*(?:#|No\s*|\s)\s*", response_text, flags=re.IGNORECASE):
             part = part.strip()
             if not part:
                 continue
@@ -2032,7 +2086,7 @@ def translate_srt_native(
     model = translation_model or (
         "gemini-3.5-flash" if translator == "gemini" else
         "gpt-4o-mini" if translator == "openai" else
-        "claude-4.5-haiku-latest" if translator == "anthropic" else
+        "claude-haiku-4-5" if translator == "anthropic" else
         "google-v1-free" if translator == "google" else
         "deepl-translator"
     )
@@ -2191,8 +2245,9 @@ def interactive_wizard(
             f"  Saved Whisper Model: {C.CYAN}"
             f"{(cfg_memory.get('model') or 'None').upper()}{C.RESET}"
         )
-        device, compute = resolve_device_and_compute()
-        print(f"  Detected Device:     {C.CYAN}{device} ({compute}){C.RESET}")
+        args.device = cfg_memory.get("device", "auto")
+        device, compute = resolve_device_and_compute(args.device)
+        print(f"  Configured Device:   {C.CYAN}{device} ({compute}){C.RESET}")
 
         fast_path = (
             input(
@@ -2243,6 +2298,7 @@ def interactive_wizard(
                 "api_key",
                 "min_blocks",
                 "model",
+                "device",
             ]:
                 Context.provenance[k] = "Saved Profile"
             Context.provenance["translate"] = "Saved Profile"
@@ -2256,7 +2312,7 @@ def interactive_wizard(
             print(
                 f"    - Transcription:     "
                 f"{C.CYAN}{'Enabled' if args.transcribe else 'Disabled'}{C.RESET}"
-                f"  (Model: {args.model.upper()})"
+                f"  (Model: {args.model.upper()} on {device.upper()})"
             )
             print(
                 f"    - Translation:       "
@@ -2315,17 +2371,50 @@ def interactive_wizard(
     args.src_lang = src_in if src_in else (saved_src if saved_src else None)
     Context.provenance["src_lang"] = "Interactive"
 
-    # Step 5: Whisper model
-    vram_avail = get_available_vram_gb()
-    device, compute = resolve_device_and_compute()
-    vram_label = f"{vram_avail:.1f} GB free" if device == "cuda" else "CPU mode"
-    recommended = recommend_whisper_model()
+    # Step 5a: Compute Device selection
+    print(f"\n{C.BOLD}> Step 5a: Compute Device{C.RESET}")
+    device_detected, _ = resolve_device_and_compute("auto")
+    print(f"  Detected support: {C.CYAN}{device_detected.upper()}{C.RESET}")
+    print(f"    {C.CYAN}[0]{C.RESET} Auto-detect device")
+    print(f"    {C.CYAN}[1]{C.RESET} Force CPU Mode")
+    print(f"    {C.CYAN}[2]{C.RESET} Force CUDA GPU Mode (Requires NVIDIA GPU)")
+
+    saved_dev = cfg_memory.get("device", "auto")
+    dev_default_num = "0" if saved_dev == "auto" else "1" if saved_dev == "cpu" else "2"
+    dev_in = input(f"  Selection [{dev_default_num}]: ").strip() or dev_default_num
+    
+    dev_map = {"0": "auto", "1": "cpu", "2": "cuda"}
+    args.device = dev_map.get(dev_in, saved_dev)
+    Context.provenance["device"] = "Interactive"
+    
+    device_resolved, compute_resolved = resolve_device_and_compute(args.device)
+    print(f"  -> Resolved Device: {C.GREEN}{device_resolved.upper()} ({compute_resolved}){C.RESET}")
+
+    # Step 5b: Whisper model (Re-evaluated based on selected device)
+    vram_avail = get_available_vram_gb() if device_resolved == "cuda" else 0.0
+    vram_label = f"{vram_avail:.1f} GB free" if device_resolved == "cuda" else "CPU mode"
+    
+    if device_resolved == "cpu":
+        recommended = "1"  # "base" is a safe recommendation for CPU
+    else:
+        if vram_avail >= 10.0:
+            recommended = "5"
+        elif vram_avail >= 6.0:
+            recommended = "4"
+        elif vram_avail >= 5.0:
+            recommended = "3"
+        elif vram_avail >= 2.5:
+            recommended = "2"
+        elif vram_avail >= 1.5:
+            recommended = "1"
+        else:
+            recommended = "0"
 
     print(
-        f"\n{C.BOLD}> Step 5: Transcription Model "
+        f"\n{C.BOLD}> Step 5b: Transcription Model "
         f"(Recommended: {MODEL_MAP[recommended].upper()}){C.RESET}"
     )
-    print(f"  {C.DIM}Device: {device}  ({vram_label}){C.RESET}")
+    print(f"  {C.DIM}Selected Device: {device_resolved.upper()}  ({vram_label}){C.RESET}")
     print(f"    {C.CYAN}[0]{C.RESET} Tiny           ~1.0 GB  Fastest")
     print(f"    {C.CYAN}[1]{C.RESET} Base           ~1.5 GB  Fast")
     print(f"    {C.CYAN}[2]{C.RESET} Small          ~2.5 GB  Recommended")
@@ -2346,7 +2435,7 @@ def interactive_wizard(
     print(f"\n{C.BOLD}> Step 6: Translation Service Provider{C.RESET}")
     print(f"    {C.CYAN}[0]{C.RESET} Gemini           (Free/Flash options)")
     print(f"    {C.CYAN}[1]{C.RESET} OpenAI           (GPT models / Custom compatibles)")
-    print(f"    {C.CYAN}[2]{C.RESET} Anthropic        (Claude-3 models)")
+    print(f"    {C.CYAN}[2]{C.RESET} Anthropic        (Claude-4 models)")
     print(f"    {C.CYAN}[3]{C.RESET} DeepL            (Dedicated plain text translation)")
     print(f"    {C.CYAN}[4]{C.RESET} Google Translate (Free / Unofficial v1 API)")
     
@@ -2358,7 +2447,7 @@ def interactive_wizard(
     model_defaults = {
         "gemini": "gemini-3.5-flash",
         "openai": "gpt-4o-mini",
-        "anthropic": "claude-4.5-haiku-latest",
+        "anthropic": "claude-haiku-4-5",
         "deepl": "deepl-translator",
         "google": "google-v1-free"
     }
@@ -2505,6 +2594,7 @@ def interactive_wizard(
         "src_lang": args.src_lang or "",
         "min_blocks": args.min_blocks,
         "model": args.model,
+        "device": args.device,
         "skip_cleanup": args.no_cleanup,
         "skip_migration": args.skip_migration,
         "explain_summary": args.explain_summary,
@@ -2712,7 +2802,7 @@ def _transcribe_audio(
             )
             
             lang_hint = args.src_lang if args.src_lang else None
-            device, compute = resolve_device_and_compute()
+            device, compute = resolve_device_and_compute(args.device)
             
             generator = TranscriptionManager.transcribe(
                 audio_path=str(temp_audio),
@@ -2733,12 +2823,14 @@ def _transcribe_audio(
                             detected_lang, prob = data
                         elif event == "segment":
                             start, end, text = data
-                            f.write(
-                                f"{idx}\n"
-                                f"{fmt_srt_ts(start)} --> {fmt_srt_ts(end)}\n"
-                                f"{text.strip()}\n\n"
-                            )
-                            idx += 1
+                            cleaned_text = text.strip()
+                            if cleaned_text:
+                                f.write(
+                                    f"{idx}\n"
+                                    f"{fmt_srt_ts(start)} --> {fmt_srt_ts(end)}\n"
+                                    f"{cleaned_text}\n\n"
+                                )
+                                idx += 1
                             if not Context.quiet:
                                 if duration > 0:
                                     pct = min(end / duration * 100, 100.0)
@@ -3263,14 +3355,13 @@ def enumerate_media_files(folder: Union[str, Path], recursive: bool = False) -> 
     for p in files:
         if p.is_file() and p.suffix.lower() in MEDIA_EXTS:
             try:
-                if p.is_symlink():
-                    real = p.resolve()
-                    folder_real = folder_path.resolve()
-                    if not is_safe_relative(real, folder_real):
-                        logger.warning("Skipping symlink outside target: %s", p)
-                        continue
+                # Dynamic safety checks for path traversal / symlink loops in nested directories
+                real_p = p.resolve()
+                if not is_safe_relative(real_p, folder_path):
+                    logger.warning("Skipping file resolving outside target root: %s", p)
+                    continue
             except (OSError, RuntimeError):
-                pass
+                continue
             media_files.append(p)
 
     media_files.sort(key=lambda x: natural_keys(x.name))
@@ -3355,7 +3446,7 @@ def main() -> None:
             "  %(prog)s                                   # Interactive wizard mode\n"
             "  %(prog)s --headless --folder ./videos      # Process all videos\n"
             "  %(prog)s --headless --folder ./videos --watch  # Watch mode\n"
-            "  %(prog)s --headless --folder . --model small --tgt-lang Arabic\n"
+            "  %(prog)s --headless --folder . --model small --device cuda\n"
             "  %(prog)s --version                         # Show version"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3365,6 +3456,7 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true", help="Run without interactive prompts")
     parser.add_argument("--folder", type=str, help="Target directory containing media files")
     parser.add_argument("--model", type=str, default=None, help="Whisper model to use")
+    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default=None, help="Compute device for Whisper (auto, cpu, cuda)")
     parser.add_argument("--src-lang", type=str, default=None, dest="src_lang", help="Source language code")
     parser.add_argument("--tgt-lang", type=str, default=None, dest="tgt_lang", help="Target language name")
     parser.add_argument("--tgt-ext", type=str, default=None, dest="tgt_ext", help="Target subtitle extension (e.g., en, ar)")
@@ -3576,6 +3668,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Crucial Windows PyInstaller / spawn multiprocessing intercept
+    multiprocessing.freeze_support()
     try:
         main()
     except KeyboardInterrupt:
