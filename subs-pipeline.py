@@ -461,12 +461,15 @@ def get_available_vram_gb() -> float:
     return 0.0
 
 
-def resolve_device_and_compute() -> Tuple[str, str]:
-    """Dynamically determine processing device and computation precision types."""
+def resolve_device_and_compute(mode: str = "auto") -> Tuple[str, str]:
+    mode = (mode or "auto").lower().strip()
+    if mode == "cpu":
+        return "cpu", "int8"
+    if mode == "cuda":
+        return ("cuda", "float16") if _TORCH_AVAILABLE and _torch.cuda.is_available() else ("cpu", "int8")
     if _TORCH_AVAILABLE and _torch.cuda.is_available():
         return "cuda", "float16"
     return "cpu", "int8"
-
 
 def recommend_whisper_model() -> str:
     """Recommend a Whisper model based on available hardware."""
