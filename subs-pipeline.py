@@ -1,3 +1,11 @@
+"""
+Subs Pipeline: An Automated Video Transcription and Translation Pipeline.
+
+This pipeline automates transcription using local Faster Whisper engines and translates
+subtitles through leading API endpoints (Gemini, OpenAI, Anthropic, DeepL, Google).
+It handles batch processing, filesystem watching, error recovery, and robust video muxing.
+"""
+
 import os
 import re
 import sys
@@ -12,18 +20,19 @@ import platform
 import tempfile
 import threading
 import subprocess
+import multiprocessing
+import queue
+import random
+import contextlib
 import gzip
 import ssl
 import urllib.request
 import urllib.parse
 import urllib.error
 import difflib
-import multiprocessing
-import queue
-import random
-import contextlib
 from pathlib import Path
-from typing import Any, Optional, Union, Tuple, List, Dict, Set, Generator
+from typing import Any, Optional, Union, Tuple, List, Dict, Set, Generator, Final
+from dataclasses import dataclass, field, asdict
 
 # ── Dynamic OpenMP and SSL Environment Overrides ──────────────────
 # Prevents crashes when duplicate OpenMP runtimes are loaded in the same process
@@ -33,8 +42,10 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 try:
     import certifi
     os.environ["SSL_CERT_FILE"] = certifi.where()
+    _CERTIFI_AVAILABLE = True
 except ImportError:
-    pass
+    certifi = None
+    _CERTIFI_AVAILABLE = False
 
 # ── Module Level Declarations ───────────────────────────
 __all__ = [
@@ -42,6 +53,7 @@ __all__ = [
     "TranscriptionManager",
     "is_valid_srt",
     "translate_srt_native",
+    "find_source_srt",
     "process_file",
     "main",
 ]
@@ -76,28 +88,29 @@ COLOR_ENABLED = not _NO_COLOR
 class C:
     """ANSI color codes with NO_COLOR environment variable support."""
 
-    CYAN: str = "\033[96m" if COLOR_ENABLED else ""
-    GREEN: str = "\033[92m" if COLOR_ENABLED else ""
-    YELLOW: str = "\033[93m" if COLOR_ENABLED else ""
-    RED: str = "\033[91m" if COLOR_ENABLED else ""
-    RESET: str = "\033[0m" if COLOR_ENABLED else ""
-    BOLD: str = "\033[1m" if COLOR_ENABLED else ""
-    DIM: str = "\033[2m" if COLOR_ENABLED else ""
+    CYAN: Final[str] = "\033[96m" if COLOR_ENABLED else ""
+    GREEN: Final[str] = "\033[92m" if COLOR_ENABLED else ""
+    YELLOW: Final[str] = "\033[93m" if COLOR_ENABLED else ""
+    RED: Final[str] = "\033[91m" if COLOR_ENABLED else ""
+    RESET: Final[str] = "\033[0m" if COLOR_ENABLED else ""
+    BOLD: Final[str] = "\033[1m" if COLOR_ENABLED else ""
+    DIM: Final[str] = "\033[2m" if COLOR_ENABLED else ""
 
 
 _ANSI_RE = re.compile(r"\033(?:\[[0-9;]*[A-Za-z]|\][^\007]*\007)")
 
 
 def strip_ansi(s: str) -> str:
-    """Remove ANSI escape codes from a string.
-
-    Args:
-        s: The raw string containing ANSI codes.
-
-    Returns:
-        The string with all ANSI escape sequences removed.
-    """
+    """Remove ANSI escape codes from a string."""
     return _ANSI_RE.sub("", s)
+
+
+def style(text: str, *codes: str) -> str:
+    """Wrap text in ANSI styling codes, ensuring reset safety."""
+    if not COLOR_ENABLED or not codes:
+        return text
+    joined = "".join(codes)
+    return f"{joined}{text}{C.RESET}"
 
 
 def enable_windows_ansi() -> None:
@@ -131,7 +144,7 @@ APP_DIR = (
 )
 CONFIG_PATH: Path = APP_DIR / "subs_pipeline_settings.json"
 
-MEDIA_EXTS: Tuple[str, ...] = (
+MEDIA_EXTS: Final[Tuple[str, ...]] = (
     ".mkv",
     ".mp4",
     ".webm",
@@ -148,18 +161,18 @@ MEDIA_EXTS: Tuple[str, ...] = (
     ".flac",
     ".opus",
 )
-AUDIO_EXTS: Tuple[str, ...] = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus")
+AUDIO_EXTS: Final[Tuple[str, ...]] = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus")
 
 # API Configuration Defaults
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
-GEMINI_URL_TEMPLATE = (
+DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3.5-flash"
+GEMINI_URL_TEMPLATE: Final[str] = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "{model}:generateContent?key={key}"
 )
 API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.+/\-=@#$!%^&*()]{10,120}$")
 
 # VRAM Requirements (in GB)
-VRAM_REQUIREMENTS: Dict[str, float] = {
+VRAM_REQUIREMENTS: Final[Dict[str, float]] = {
     "tiny": 1.0,
     "base": 1.5,
     "small": 2.5,
@@ -168,13 +181,20 @@ VRAM_REQUIREMENTS: Dict[str, float] = {
     "large-v3": 10.0,
 }
 
-MODEL_MAP: Dict[str, str] = {
+MODEL_MAP: Final[Dict[str, str]] = {
     "0": "tiny",
     "1": "base",
     "2": "small",
     "3": "medium",
     "4": "large-v3-turbo",
     "5": "large-v3",
+}
+
+# Dynamic Fallbacks for Translation Services
+FALLBACK_MODELS: Final[Dict[str, str]] = {
+    "gemini": "gemini-3.5-flash",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-haiku-4-5",
 }
 
 # Timings & Chunking Constants
@@ -186,7 +206,22 @@ MUXED_MIN_BYTES: int = 1000
 FILE_SETTLE_MAX_RETRIES: int = 6
 FILE_SETTLE_DELAY: float = 1.5
 WHISPER_BEAM_SIZE: int = 5
-WHISPER_TRANSCRIBE_TIMEOUT: int = 10800  # Dynamic protection bump to 3 hours maximum for transcription
+WHISPER_TRANSCRIBE_TIMEOUT: int = 10800  # 3 hours max for transcription
+
+# Named constants to avoid raw values inside execution pathways
+WORKER_INIT_TIMEOUT: Final[float] = 45.0
+WATCHER_IN_FLIGHT_EXPIRY: Final[float] = 1800.0
+RATE_LIMITER_POLL_INTERVAL: Final[float] = 0.05
+STDERR_TRUNCATION_LIMIT: Final[int] = 500
+FFMPEG_PROCESS_TIMEOUT: Final[float] = 600.0  # Kept for backward compatibility references
+FFMPEG_STREAM_TIMEOUT: Final[float] = 600.0   # 10 minutes max for fast stream operations
+FFMPEG_TRANSCODE_TIMEOUT: Final[float] = 3600.0 # 1 hour max for rendering heavy hardsubs
+MAX_CHUNK_CHAR_LIMIT: Final[int] = 5000  # Dialogue character length limit per translation request
+
+# Sensitive Key substrings
+SENSITIVE_KEY_SUBSTRINGS: Final[List[str]] = [
+    "api_key", "token", "secret", "password", "api_url", "gateway", "key="
+]
 
 # Audio extraction settings
 AUDIO_SAMPLE_RATE: int = 16000
@@ -215,19 +250,15 @@ TRANSLATION_RETRY_BASE_DELAY: float = 2.0
 SRT_TIMESTAMP_PATTERN = re.compile(
     r"(\d+:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d+:\d{2}:\d{2}[,\.]\d{3})"
 )
-TRIVIAL_WORDS: Set[str] = {
-    "oh",
-    "ah",
-    "okay",
-    "ok",
-    "yeah",
-    "yes",
-    "no",
-    "uh",
-    "hmm",
-    "ha",
-    "hey",
-    "wow",
+
+# Standard multilingual trivial words
+MULTILINGUAL_TRIVIAL_WORDS: Final[Dict[str, Set[str]]] = {
+    "en": {"oh", "ah", "okay", "ok", "yeah", "yes", "no", "uh", "hmm", "ha", "hey", "wow"},
+    "ja": {"あの", "ええと", "はい", "いいえ", "うん", "うーん", "まぁ", "そう"},
+    "es": {"oh", "ah", "bueno", "sí", "no", "oye", "vaya", "eh", "hola"},
+    "fr": {"ah", "oh", "oui", "non", "bon", "bah", "hein", "ouais", "allô"},
+    "zh": {"嗯", "啊", "哦", "好的", "那个", "就是", "哈"},
+    "ko": {"아", "어", "예", "아니오", "음", "와", "네", "그래"}
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -239,7 +270,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_blocks": 3,
     "model": "small",
     "device": "auto",
-    "skip_cleanup": False,
+    "no_cleanup": False,
     "skip_migration": False,
     "explain_summary": True,
     "srt_max_avg_duration": 10.0,
@@ -254,13 +285,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "whisper_beam_size": WHISPER_BEAM_SIZE,
 }
 
-# Dynamic Fallbacks for Translation Services
-FALLBACK_MODELS: Dict[str, str] = {
-    "gemini": "gemini-3.5-flash",
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-haiku-4-5",
-}
-
 # Unified Box-Drawing Constants
 BOX_TL = "\u2554"
 BOX_TR = "\u2557"
@@ -272,6 +296,106 @@ BOX_BL = "\u255a"
 BOX_BR = "\u255d"
 
 _config_save_lock = threading.Lock()
+
+
+# ════════════════════════════════════════════════════════════
+#  PIPELINE CONFIG & STATUS SCHEMAS
+# ════════════════════════════════════════════════════════════
+@dataclass
+class PipelineConfig:
+    schema_version: int = 2
+    folder: str = ""
+    api_key: str = ""
+    tgt_lang: str = "English"
+    tgt_ext: str = "en"
+    src_lang: Optional[str] = None
+    min_blocks: int = 3
+    model: str = "small"
+    device: str = "auto"
+    skip_migration: bool = False
+    explain_summary: bool = True
+    srt_max_avg_duration: float = 10.0
+    srt_min_avg_duration: float = 0.1
+    srt_dup_ratio: float = 0.6
+    fallback_match_threshold: float = 0.95
+    max_audit_logs: int = 30
+    gemini_model: str = "gemini-3.5-flash"
+    translator: str = "gemini"
+    translation_model: str = "gemini-3.5-flash"
+    api_url: str = ""
+    whisper_beam_size: int = 5
+    
+    # Executable flags derived during parsed argument mergers
+    headless: bool = False
+    watch: bool = False
+    dry_run: bool = False
+    no_audit: bool = False
+    verbose_summary: bool = False
+    recursive: bool = False
+    quiet: bool = False
+    verbose: bool = False
+    test: bool = False
+    
+    # Skip flags parsed from options
+    skip_transcribe: bool = False
+    skip_translate: bool = False
+    skip_embed: bool = False
+    no_cleanup: bool = False
+    
+    # Final operational targets
+    transcribe: bool = True
+    translate: bool = True
+    embed: bool = True
+    hardsub: bool = False
+
+
+@dataclass
+class FileStatus:
+    transcribed: bool = False
+    translated: bool = False
+    reused_srt: bool = False
+    reused_all: bool = False
+    mixed_language: bool = False
+    partial_success: bool = False
+    fallback_count: int = 0
+    muxed: bool = False
+    skipped: bool = False
+    error: bool = False
+    audio_failed: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ════════════════════════════════════════════════════════════
+#  CUSTOM LOGGING AND EXCEPTIONS
+# ════════════════════════════════════════════════════════════
+class PipelineError(Exception):
+    """Base exception class for all pipeline-related failures."""
+    pass
+
+class TranscriptionError(PipelineError):
+    """Exception raised during audio transcription steps."""
+    pass
+
+class TranslationError(PipelineError):
+    """Exception raised during API translation steps."""
+    pass
+
+class MuxError(PipelineError):
+    """Exception raised during FFmpeg muxing or burning operations."""
+    pass
+
+
+class ColorLogFormatter(logging.Formatter):
+    """Custom formatter to render log records with color safely depending on state."""
+    def format(self, record: logging.LogRecord) -> str:
+        res = super().format(record)
+        if record.levelno >= logging.ERROR:
+            return style(res, C.RED, C.BOLD)
+        elif record.levelno >= logging.WARNING:
+            return style(res, C.YELLOW)
+        return res
 
 
 # ════════════════════════════════════════════════════════════
@@ -290,7 +414,7 @@ def setup_logging(quiet: bool = False, verbose: bool = False) -> logging.Logger:
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(logger.level)
-        fmt = logging.Formatter(
+        fmt = ColorLogFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%H:%M:%S",
         )
@@ -419,9 +543,7 @@ def qprint(*args, **kwargs) -> None:
     logger.info(strip_ansi(msg))
 
 
-# ════════════════════════════════════════════════════════════
-#  DEPENDENCY RESOLUTION & HARDWARE CHECKING
-# ════════════════════════════════════════════════════════════
+# ── Dependency Check & FFmpeg Finder ────────────────────
 REQUIRED_PACKAGES: List[str] = ["faster_whisper"]
 
 
@@ -489,23 +611,30 @@ def resolve_device_and_compute(mode: str = "auto") -> Tuple[str, str]:
         return "cuda", "float16"
     return "cpu", "int8"
 
+
+def get_model_recommendation(vram_gb: float, is_cpu: bool) -> str:
+    """Return recommended model based on computed VRAM or CPU state."""
+    if is_cpu:
+        return "1"  # "base"
+    if vram_gb >= 10.0:
+        return "5"  # "large-v3"
+    elif vram_gb >= 6.0:
+        return "4"  # "large-v3-turbo"
+    elif vram_gb >= 5.0:
+        return "3"  # "medium"
+    elif vram_gb >= 2.5:
+        return "2"  # "small"
+    elif vram_gb >= 1.5:
+        return "1"  # "base"
+    return "0"  # "tiny"
+
+
 def recommend_whisper_model() -> str:
     """Recommend a Whisper model based on available hardware."""
     device, _ = resolve_device_and_compute()
-    if device == "cpu":
-        return "1"
+    is_cpu = (device == "cpu")
     vram = get_available_vram_gb()
-    if vram >= 10.0:
-        return "5"
-    elif vram >= 6.0:
-        return "4"
-    elif vram >= 5.0:
-        return "3"
-    elif vram >= 2.5:
-        return "2"
-    elif vram >= 1.5:
-        return "1"
-    return "0"
+    return get_model_recommendation(vram, is_cpu)
 
 
 def download_whisper_model_if_needed(model_name: str) -> bool:
@@ -624,7 +753,7 @@ class TranscriptionManager:
         with cls._transcribe_mutex:
             with cls._lock:
                 if cls._is_running:
-                    raise RuntimeError("Another transcription is currently in progress.")
+                    raise TranscriptionError("Another transcription is currently in progress.")
                 cls._is_running = True
 
                 target_model = (model_name, device, compute_type)
@@ -643,22 +772,22 @@ class TranscriptionManager:
                     init_timeout = False
                     msg_type, payload = None, None
                     try:
-                        msg_type, payload = cls._res_queue.get(timeout=45.0)
+                        msg_type, payload = cls._res_queue.get(timeout=WORKER_INIT_TIMEOUT)
                     except queue.Empty:
                         init_timeout = True
 
                     if init_timeout:
                         cls.terminate_with_lock()
                         cls._is_running = False
-                        raise RuntimeError("Failed to communicate with transcription worker (initialization timeout).")
+                        raise TranscriptionError("Failed to communicate with transcription worker (initialization timeout).")
                     elif msg_type == "init_error":
                         cls.terminate_with_lock()
                         cls._is_running = False
-                        raise RuntimeError(f"Transcription worker initialization failed: {payload}")
+                        raise TranscriptionError(f"Transcription worker initialization failed: {payload}")
                     elif msg_type != "init_ok":
                         cls.terminate_with_lock()
                         cls._is_running = False
-                        raise RuntimeError(f"Unexpected response from transcription worker initialization: {msg_type}")
+                        raise TranscriptionError(f"Unexpected response from transcription worker initialization: {msg_type}")
 
                 cls._drain_queue(cls._res_queue)
                 cls._req_queue.put((audio_path, lang_hint, beam_size))
@@ -669,7 +798,7 @@ class TranscriptionManager:
                     rem = deadline - time.monotonic()
                     if rem <= 0:
                         cls.terminate()
-                        raise TimeoutError(f"Transcription timed out after {timeout} seconds")
+                        raise TranscriptionError(f"Transcription timed out after {timeout} seconds")
 
                     try:
                         msg_type, data = cls._res_queue.get(timeout=min(rem, 1.0))
@@ -680,11 +809,11 @@ class TranscriptionManager:
                         elif msg_type == "done":
                             break
                         elif msg_type == "error":
-                            raise RuntimeError(data)
+                            raise TranscriptionError(data)
                     except queue.Empty:
                         with cls._lock:
                             if cls._process is not None and not cls._process.is_alive():
-                                raise RuntimeError("Transcription worker process terminated unexpectedly")
+                                raise TranscriptionError("Transcription worker process terminated unexpectedly")
                         continue
             finally:
                 with cls._lock:
@@ -818,8 +947,8 @@ def startup_garbage_collection(
             logger.debug("Permission error during garbage collection of folder %s: %s", target_dir, e)
     if cleaned_count > 0:
         qprint(
-            f"  {C.DIM}[~] Swept workspaces: Purged {cleaned_count} stale temp "
-            f"file(s).{C.RESET}"
+            f"  {style('[~]', C.DIM)} Swept workspaces: Purged {cleaned_count} stale temp "
+            f"file(s)."
         )
 
 
@@ -834,8 +963,8 @@ def check_disk_space(path: Union[str, Path], required_bytes: int = MIN_FREE_DISK
         free = shutil.disk_usage(target).free
         if free < required_bytes:
             qprint(
-                f"{C.YELLOW}[!] Low disk space: {free // (1024**2)} MB available, "
-                f"{required_bytes // (1024**2)} MB recommended.{C.RESET}"
+                f"{style('[!]', C.YELLOW)} Low disk space: {free // (1024**2)} MB available, "
+                f"{required_bytes // (1024**2)} MB recommended."
             )
             return False
         return True
@@ -853,8 +982,8 @@ def exit_app(code: int = 0) -> None:
     TranscriptionManager.terminate()
     if Context.failed_cleanups:
         qprint(
-            f"\n{C.DIM}  [~] System cleanup complete. Some active lock files were "
-            f"bypassed:{C.RESET}"
+            f"\n{style('[~]', C.DIM)} System cleanup complete. Some active lock files were "
+            f"bypassed:"
         )
         for item in set(Context.failed_cleanups):
             qprint(f"      · {item}")
@@ -898,9 +1027,9 @@ def validate_schema(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
         cfg_dict["schema_version"] = DEFAULT_CONFIG["schema_version"]
     elif cfg_dict["schema_version"] < DEFAULT_CONFIG["schema_version"]:
         qprint(
-            f"  {C.YELLOW}[~] Legacy config schema version "
+            f"  {style('[~]', C.YELLOW)} Legacy config schema version "
             f"{cfg_dict.get('schema_version')} detected. Updating to version "
-            f"{DEFAULT_CONFIG['schema_version']}.{C.RESET}"
+            f"{DEFAULT_CONFIG['schema_version']}."
         )
         cfg_dict["schema_version"] = DEFAULT_CONFIG["schema_version"]
 
@@ -938,8 +1067,8 @@ def validate_schema(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
                 min_val, max_val, fallback = range_rules[key]
                 if cfg_dict[key] < min_val or cfg_dict[key] > max_val:
                     qprint(
-                        f"  {C.YELLOW}[!] Config key '{key}' out of range "
-                        f"[{min_val} - {max_val}]. Resetting to default '{fallback}'.{C.RESET}"
+                        f"  {style('[!]', C.YELLOW)} Config key '{key}' out of range "
+                        f"[{min_val} - {max_val}]. Resetting to default '{fallback}'."
                     )
                     cfg_dict[key] = fallback
         else:
@@ -958,6 +1087,10 @@ def load_config() -> Dict[str, Any]:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
+                
+                # Map legacy skip_cleanup key down to no_cleanup parameters
+                if "skip_cleanup" in loaded:
+                    loaded["no_cleanup"] = loaded.pop("skip_cleanup")
                 
                 if loaded.get("api_key") and loaded["api_key"].startswith("obf:"):
                     import base64
@@ -1007,7 +1140,7 @@ def save_config(conf: Dict[str, Any]) -> None:
                 except Exception as e:
                     logger.debug("Failed to set file permissions on config path: %s", e)
         except Exception as e:
-            qprint(f"\n  {C.YELLOW}[!] Config save failed: {e}{C.RESET}")
+            qprint(f"\n  {style('[!]', C.YELLOW)} Config save failed: {e}")
             if tmp_path is not None:
                 try:
                     tmp_path.unlink(missing_ok=True)
@@ -1101,6 +1234,7 @@ def get_duration(media_path: Union[str, Path]) -> float:
             encoding="utf-8",
             errors="replace",
             stderr=subprocess.DEVNULL,
+            timeout=30.0
         ).strip()
         val = float(result)
         return val if val > 0 else 0.0
@@ -1119,7 +1253,7 @@ def perform_vram_gc() -> None:
             logger.debug("CUDA empty cache failed: %s", e)
 
 
-def normalize_dialogue(text: Optional[str]) -> str:
+def normalize_dialogue(text: Optional[str], lang: str = "en") -> str:
     """Normalize subtitle dialogue for comparison by removing markup and trivial words."""
     if not text:
         return ""
@@ -1128,7 +1262,11 @@ def normalize_dialogue(text: Optional[str]) -> str:
     t = re.sub(r"\([^\)]*\)", "", t)
     t = re.sub(r"<[^>]*>", "", t)
     t = re.sub(r"[^\w\s]", "", t)
-    words = [w for w in t.split() if w not in TRIVIAL_WORDS]
+    
+    lang_clean = (lang or "en").lower()[:2]
+    trivial_set = MULTILINGUAL_TRIVIAL_WORDS.get(lang_clean, MULTILINGUAL_TRIVIAL_WORDS["en"])
+    
+    words = [w for w in t.split() if w not in trivial_set]
     return " ".join(words)
 
 
@@ -1171,6 +1309,7 @@ def detect_fallbacks(
     src_path: Union[str, Path],
     tgt_path: Union[str, Path],
     fallback_match_threshold: float,
+    lang_code: str = "en"
 ) -> Tuple[int, str]:
     """Detect translation fallback blocks where target matches source via ID matching."""
     src_map = parse_srt_to_dict(src_path)
@@ -1188,8 +1327,8 @@ def detect_fallbacks(
         s_clean = src_txt.replace("\u266a", "").strip()
         t_clean = tgt_txt.replace("\u266a", "").strip()
 
-        s_norm = normalize_dialogue(s_clean)
-        t_norm = normalize_dialogue(t_clean)
+        s_norm = normalize_dialogue(s_clean, lang_code)
+        t_norm = normalize_dialogue(t_clean, lang_code)
 
         if len(s_norm) < 4 or len(t_norm) < 4:
             continue
@@ -1204,6 +1343,80 @@ def detect_fallbacks(
     return match_count, f"{match_count} blocks matching source"
 
 
+def find_source_srt(media_path: Union[str, Path], tgt_ext: str, src_lang: Optional[str] = None) -> Tuple[Path, str]:
+    """Locate and return an existing source subtitle file associated with a media file."""
+    media_path = Path(media_path)
+    parent = media_path.parent
+    stem = media_path.stem
+    tgt_ext_clean = tgt_ext.strip().lower()
+    
+    candidates: List[Tuple[Path, str]] = []
+    try:
+        for item in parent.iterdir():
+            if item.is_file() and item.suffix.lower() == ".srt":
+                name = item.name
+                if name == f"{stem}.srt":
+                    candidates.append((item, "und"))
+                elif name.startswith(f"{stem}."):
+                    suffix_len = len(".srt")
+                    mid_part = name[len(stem) + 1 : -suffix_len]
+                    if mid_part and "." not in mid_part:
+                        if mid_part.lower() != tgt_ext_clean:
+                            candidates.append((item, mid_part.lower()))
+    except Exception as e:
+        logger.debug("Error searching for source SRT: %s", e)
+
+    if src_lang:
+        src_lang_clean = src_lang.strip().lower()
+        for path, lang in candidates:
+            if lang == src_lang_clean:
+                return path, lang
+        # If explicitly requested, an unrelated candidate language must not fall through
+        return parent / f"{stem}.{src_lang_clean}.srt", src_lang_clean
+    
+    for path, lang in candidates:
+        if lang != "und":
+            return path, lang
+            
+    for path, lang in candidates:
+        if lang == "und":
+            return path, lang
+
+    default_lang = src_lang if src_lang else "und"
+    if default_lang != "und":
+        default_path = parent / f"{stem}.{default_lang}.srt"
+    else:
+        default_path = parent / f"{stem}.subs-pipeline.srt"
+    return default_path, default_lang
+
+
+def _prepare_translation_prompt(chunk: List[str], tgt_lang: str) -> str:
+    """Prepare a structured translation prompt for translation APIs."""
+    prompt_lines = [
+        f"You are a professional film/media translator. Translate the following subtitle blocks into accurate, natural, and context-aware {tgt_lang}.",
+        "Preserve the tone, colloquialisms, and original meaning as closely as possible.",
+        "Strictly follow these formatting constraints:",
+        "1. Respond ONLY with the translations, using exactly the block format template shown below.",
+        "2. Do not write any introduction, commentary, explanations, or Markdown code block wrappers. Only output the formatted translation blocks.",
+        "3. Each block output must strictly follow this pattern: 'Block #[ID]: [translated_text]'",
+        "4. If a block contains multiple lines, keep them on separate lines under the same Block ID.",
+        "5. Do not alter, merge, or omit any Block IDs.",
+        "\nInput blocks to translate:\n"
+    ]
+    
+    for block in chunk:
+        lines = block.splitlines()
+        if len(lines) >= 3:
+            try:
+                b_id = int(lines[0])
+            except ValueError:
+                b_id = 0
+            dialogue = "\n".join(lines[2:])
+            prompt_lines.append(f"Block #{b_id}:\n{dialogue}\n")
+            
+    return "\n".join(prompt_lines)
+
+
 # ════════════════════════════════════════════════════════════
 #  SRT HEALTH CHECK
 # ════════════════════════════════════════════════════════════
@@ -1211,15 +1424,15 @@ def is_valid_srt(
     srt_path: Union[str, Path],
     media_duration: float = 0.0,
     min_blocks: int = 3,
-    args_ref: Optional[argparse.Namespace] = None,
+    args_ref: Optional[PipelineConfig] = None,
 ) -> Tuple[bool, str]:
     """Validate an SRT file for structural integrity and quality."""
     if args_ref is None:
-        args_ref = argparse.Namespace(**DEFAULT_CONFIG)
+        args_ref = PipelineConfig()
 
-    max_duration: float = getattr(args_ref, "srt_max_avg_duration", 10.0)
-    min_duration: float = getattr(args_ref, "srt_min_avg_duration", 0.1)
-    dup_threshold: float = getattr(args_ref, "srt_dup_ratio", 0.6)
+    max_duration: float = args_ref.srt_max_avg_duration
+    min_duration: float = args_ref.srt_min_avg_duration
+    dup_threshold: float = args_ref.srt_dup_ratio
 
     try:
         p = Path(srt_path)
@@ -1312,6 +1525,28 @@ def is_valid_srt(
 
 
 # ════════════════════════════════════════════════════════════
+#  BOX RENDERING AND FORMATTING TOOLS
+# ════════════════════════════════════════════════════════════
+def render_box(lines: List[str], width: int = 72) -> str:
+    """Safely render lines wrapped inside a box structure of explicit width, with truncation guards."""
+    max_line_len = max((len(strip_ansi(ln)) for ln in lines), default=0)
+    if max_line_len > width:
+        width = max_line_len
+
+    rendered_lines = []
+    rendered_lines.append(style(BOX_TL + BOX_HL * width + BOX_TR, C.CYAN, C.BOLD))
+    for ln in lines:
+        plain_len = len(strip_ansi(ln))
+        if plain_len > width:
+            ln = ln[:width-3] + "..."
+            plain_len = len(strip_ansi(ln))
+        padding = " " * (width - plain_len)
+        rendered_lines.append(f"{style(BOX_VL, C.CYAN, C.BOLD)}{ln}{padding}{style(BOX_VL, C.CYAN, C.BOLD)}")
+    rendered_lines.append(style(BOX_BL + BOX_HL * width + BOX_BR, C.CYAN, C.BOLD))
+    return "\n".join(rendered_lines)
+
+
+# ════════════════════════════════════════════════════════════
 #  API KEY VALIDATION
 # ════════════════════════════════════════════════════════════
 def validate_api_key(key: str) -> Tuple[bool, str]:
@@ -1338,9 +1573,53 @@ def validate_tgt_ext(ext: str) -> Tuple[bool, str]:
 
 
 # ════════════════════════════════════════════════════════════
+#  SENSITIVE INFORMATION MASKING
+# ════════════════════════════════════════════════════════════
+def should_mask(key_name: str, value_str: str = "") -> bool:
+    """Determine if a config key or string value contains sensitive components."""
+    k = key_name.lower()
+    if any(substr in k for substr in SENSITIVE_KEY_SUBSTRINGS):
+        return True
+    if value_str:
+        val_lower = value_str.lower()
+        if "key=" in val_lower or "api_key=" in val_lower or "token=" in val_lower:
+            return True
+    return False
+
+
+# ════════════════════════════════════════════════════════════
 #  VALIDATION & AUDITING
 # ════════════════════════════════════════════════════════════
-def validate_args(args: argparse.Namespace) -> None:
+def resolve_pipeline_steps(args: PipelineConfig, respect_interactive: bool = False) -> None:
+    """Consistently resolve active steps based on CLI constraints, key validation, and skip options."""
+    if not respect_interactive:
+        args.transcribe = not getattr(args, "skip_transcribe", False)
+    else:
+        if getattr(args, "skip_transcribe", False):
+            args.transcribe = False
+
+    has_api_key = bool(getattr(args, "api_key", ""))
+    is_google = (getattr(args, "translator", "gemini") == "google")
+    
+    if not respect_interactive:
+        args.translate = (has_api_key or is_google) and not getattr(args, "skip_translate", False)
+    else:
+        if getattr(args, "skip_translate", False):
+            args.translate = False
+        else:
+            args.translate = args.translate and (has_api_key or is_google)
+
+    if not respect_interactive:
+        args.embed = not getattr(args, "skip_embed", False)
+    else:
+        if getattr(args, "skip_embed", False):
+            args.embed = False
+    
+    if getattr(args, "hardsub", False) and not args.embed:
+        args.embed = True
+
+
+def validate_args(args: PipelineConfig) -> None:
     """Resolve configuration conflicts and apply automatic overrides."""
     adjustments: List[str] = []
     
@@ -1350,7 +1629,35 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.translator not in supported:
             adjustments.append(f"Invalid translator '{args.translator}' detected. Resetting to default 'gemini'.")
             args.translator = "gemini"
+            args.translation_model = "gemini-3.5-flash"
             Context.provenance["translator"] = "Auto-Override"
+            Context.provenance["translation_model"] = "Auto-Override"
+
+    # Auto-align the translation model defaults on mismatch to avoid endpoint errors
+    default_models = {
+        "gemini": "gemini-3.5-flash",
+        "openai": "gpt-4o-mini",
+        "anthropic": "claude-haiku-4-5",
+        "deepl": "deepl-translator",
+        "google": "google-v1-free"
+    }
+    
+    if args.translate or args.translator:
+        current_trans = args.translator.lower().strip() if args.translator else "gemini"
+        current_model = getattr(args, "translation_model", "")
+        is_mismatch = False
+        if current_trans == "gemini" and "gemini" not in current_model.lower():
+            is_mismatch = True
+        elif current_trans == "openai" and "gpt" not in current_model.lower() and "o1" not in current_model.lower():
+            is_mismatch = True
+        elif current_trans == "anthropic" and "claude" not in current_model.lower():
+            is_mismatch = True
+            
+        if is_mismatch:
+            fallback_m = default_models.get(current_trans, "gemini-3.5-flash")
+            adjustments.append(f"Model mismatch detected for '{current_trans}'. Aligning translation model to '{fallback_m}'.")
+            args.translation_model = fallback_m
+            Context.provenance["translation_model"] = "Auto-Override"
 
     if args.hardsub and not args.embed:
         adjustments.append(
@@ -1382,22 +1689,16 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if adjustments:
         qprint(
-            f"\n{C.RED}{C.BOLD}[!] Configuration Conflicts Resolved "
-            f"(Overriding Variables):{C.RESET}"
+            f"\n{style('[!]', C.RED, C.BOLD)} Configuration Conflicts Resolved "
+            f"(Overriding Variables):"
         )
         for msg in adjustments:
             qprint(f"    · {msg}")
         qprint()
 
 
-def should_mask(key_name: str) -> bool:
-    """Determine if a config key should be masked in logs."""
-    k = key_name.lower()
-    return k in ("api_key", "token", "secret", "password") or any(x in k for x in ("api_key", "_token", "_secret"))
-
-
 def write_audit_log(
-    args: argparse.Namespace, summary: List[Tuple[str, Dict[str, Any], float]], total_elapsed: float
+    args: PipelineConfig, summary: List[Tuple[str, FileStatus, float]], total_elapsed: float
 ) -> None:
     """Write a structured JSON audit log of the pipeline run with rotation."""
     if args.no_audit:
@@ -1412,7 +1713,7 @@ def write_audit_log(
         serializable_args: Dict[str, Any] = {}
         for k, v in vars(args).items():
             val = str(v) if isinstance(v, Path) else v
-            if should_mask(k):
+            if should_mask(k, str(val) if val else ""):
                 val = "[PRESENT]" if val else "[ABSENT]"
             serializable_args[k] = val
 
@@ -1423,7 +1724,7 @@ def write_audit_log(
             "processed_files": [
                 {
                     "file_name": name,
-                    "pipeline_status": status,
+                    "pipeline_status": status.as_dict() if isinstance(status, FileStatus) else status,
                     "elapsed_seconds": elapsed,
                 }
                 for name, status, elapsed in summary
@@ -1432,7 +1733,7 @@ def write_audit_log(
         with open(log_file, "w", encoding="utf-8") as f:
             json.dump(log_data, f, indent=4, ensure_ascii=False)
 
-        qprint(f"  {C.GREEN}[+] Audit log recorded to: {log_file}{C.RESET}")
+        qprint(f"  {style('[+]', C.GREEN)} Audit log recorded to: {log_file}")
 
         now = time.time()
         for f in logs_dir.glob("run-*.json"):
@@ -1460,7 +1761,7 @@ def write_audit_log(
         logger.debug("Failed to write audit log: %s", e)
 
 
-def print_effective_settings(args: argparse.Namespace) -> None:
+def print_effective_settings(args: PipelineConfig) -> None:
     """Display the effective pipeline configuration."""
 
     def get_src(key_name: str) -> str:
@@ -1472,104 +1773,95 @@ def print_effective_settings(args: argparse.Namespace) -> None:
         f"────────────────────────────{C.RESET}"
     )
     qprint(
-        f"  Target Folder:     {C.CYAN}{args.folder:<40}{C.RESET} "
-        f"{C.DIM}{get_src('folder')}{C.RESET}"
+        f"  Target Folder:     {style(args.folder, C.CYAN):<49} "
+        f"{style(get_src('folder'), C.DIM)}"
     )
     qprint(
         f"  Transcription:     "
-        f"{C.CYAN}{'Enabled' if args.transcribe else 'Disabled':<40}{C.RESET} "
-        f"{C.DIM}{get_src('model')} Model: {args.model.upper()}{C.RESET}"
+        f"{style('Enabled' if args.transcribe else 'Disabled', C.CYAN):<49} "
+        f"{style(get_src('model') + ' Model: ' + args.model.upper(), C.DIM)}"
     )
     qprint(
         f"  Compute Device:    "
-        f"{C.CYAN}{args.device.upper():<40}{C.RESET} "
-        f"{C.DIM}{get_src('device')}{C.RESET}"
+        f"{style(args.device.upper(), C.CYAN):<49} "
+        f"{style(get_src('device'), C.DIM)}"
     )
     qprint(
         f"  Translation:       "
-        f"{C.CYAN}{'Enabled' if args.translate else 'Disabled':<40}{C.RESET} "
-        f"{C.DIM}{get_src('tgt_lang')} Target: {args.tgt_lang} "
-        f"[.{args.tgt_ext}]{C.RESET}"
+        f"{style('Enabled' if args.translate else 'Disabled', C.CYAN):<49} "
+        f"{style(get_src('tgt_lang') + ' Target: ' + args.tgt_lang + ' [.' + args.tgt_ext + ']', C.DIM)}"
     )
     qprint(
-        f"  Translator Provider: {C.CYAN}{args.translator.upper():<40}{C.RESET} "
-        f"{C.DIM}Model: {args.translation_model}{C.RESET}"
+        f"  Translator Provider: {style(args.translator.upper(), C.CYAN):<49} "
+        f"{style('Model: ' + args.translation_model, C.DIM)}"
     )
     hardsub_label = "Hardsub (Burn-in)" if args.hardsub else (
         "Softsub (Mux)" if args.embed else "Disabled"
     )
     embed_src = get_src("hardsub") if args.hardsub else get_src("embed")
     qprint(
-        f"  Final Muxing:      {C.CYAN}{hardsub_label:<40}{C.RESET} "
-        f"{C.DIM}{embed_src}{C.RESET}"
+        f"  Final Muxing:      {style(hardsub_label, C.CYAN):<49} "
+        f"{style(embed_src, C.DIM)}"
     )
     qprint(
         f"  Watch Mode:        "
-        f"{C.CYAN}{'Enabled' if args.watch else 'Disabled':<40}{C.RESET} "
-        f"{C.DIM}[CLI]{C.RESET}"
+        f"{style('Enabled' if args.watch else 'Disabled', C.CYAN):<49} "
+        f"{style('[CLI]', C.DIM)}"
     )
     qprint(
         f"  Dry Run Mode:      "
-        f"{C.CYAN}{'Active' if args.dry_run else 'Inactive':<40}{C.RESET} "
-        f"{C.DIM}[CLI]{C.RESET}"
+        f"{style('Active' if args.dry_run else 'Inactive', C.CYAN):<49} "
+        f"{style('[CLI]', C.DIM)}"
     )
     qprint(
         f"  Audit Logs:        "
-        f"{C.CYAN}{'Disabled' if args.no_audit else 'Enabled':<40}{C.RESET} "
-        f"{C.DIM}[CLI]{C.RESET}"
+        f"{style('Disabled' if args.no_audit else 'Enabled', C.CYAN):<49} "
+        f"{style('[CLI]', C.DIM)}"
     )
     qprint(
         f"  Min Blocks Req:    "
-        f"{C.CYAN}{args.min_blocks:<40}{C.RESET} "
-        f"{C.DIM}{get_src('min_blocks')}{C.RESET}"
+        f"{style(str(args.min_blocks), C.CYAN):<49} "
+        f"{style(get_src('min_blocks'), C.DIM)}"
     )
     qprint(f"{C.BOLD}───────────────────────────────────────────────────────────{C.RESET}\n")
 
 
-def wait_for_file_settle(
-    path: Union[str, Path],
-    max_retries: int = FILE_SETTLE_MAX_RETRIES,
-    delay: float = FILE_SETTLE_DELAY,
-) -> bool:
-    """Wait for a file to stabilize (stop changing size and mtime)."""
-    p = Path(path)
-    if not p.exists():
-        return False
-
-    last_size = -1
-    last_mtime = -1.0
-    for _ in range(max_retries):
-        try:
-            stat = p.stat()
-            current_size = stat.st_size
-            current_mtime = stat.st_mtime
-            
-            if current_size == last_size and current_mtime == last_mtime and current_size > 0:
-                # Perform access test on Windows to respect file sharing violations
-                if platform.system() == "Windows":
-                    try:
-                        with open(p, "rb+") as f:
-                            pass
-                    except IOError:
-                        time.sleep(delay)
-                        continue
-                return True
-            
-            last_size = current_size
-            last_mtime = current_mtime
-        except (IOError, OSError):
-            pass
-        time.sleep(delay)
-    return False
-
-
 # ════════════════════════════════════════════════════════════
-#  BATCH SUMMARY
+#  BATCH SUMMARY FLAG PARSER
 # ════════════════════════════════════════════════════════════
+def _determine_flag(st: FileStatus) -> Tuple[str, str, Optional[int]]:
+    """Determine the status label, ANSI color code, and an optional fallback block count."""
+    if st.error:
+        return "FAULT", C.RED, None
+    if st.audio_failed:
+        return "AUDIO_FAIL", C.RED, None
+    if st.skipped:
+        return "SKIPPED", C.YELLOW, None
+    if st.reused_all:
+        return "REUSED", C.GREEN, None
+    if st.translated and st.muxed:
+        return "DONE_TRN", C.GREEN, None
+    if st.mixed_language and st.muxed:
+        return "MIXED", C.YELLOW, st.fallback_count
+    if st.reused_srt and st.muxed:
+        return "DONE_MUX", C.GREEN, None
+    if st.transcribed and (st.translated or st.mixed_language):
+        if st.mixed_language:
+            return "TXT+MIX", C.CYAN, st.fallback_count
+        return "TXT+TRN", C.CYAN, None
+    if st.transcribed:
+        return "TXT_ONLY", C.CYAN, None
+    if st.translated or st.reused_srt or st.mixed_language:
+        if st.mixed_language:
+            return "MIX_TRN", C.CYAN, st.fallback_count
+        return "TRN_ONLY", C.CYAN, None
+    return "NO-OP", C.DIM, None
+
+
 def print_summary(
-    summary: List[Tuple[str, Dict[str, Any], float]],
+    summary: List[Tuple[str, FileStatus, float]],
     total_elapsed: float,
-    args: argparse.Namespace,
+    args: PipelineConfig,
 ) -> None:
     """Print a formatted batch completion summary table with aligned headers."""
     W = 72
@@ -1581,10 +1873,10 @@ def print_summary(
     mid = BOX_ML + BOX_HL * W + BOX_MR
     bot = BOX_BL + BOX_HL * W + BOX_BR
 
-    print(f"\n{C.BOLD}{C.CYAN}{top}")
+    print(f"\n{style(top, C.CYAN, C.BOLD)}")
     title = f"  Batch Complete -- {fmt_time(total_elapsed)}"
-    print(f"{BOX_VL}{title:<{W}}{BOX_VL}")
-    print(f"{mid}{C.RESET}")
+    print(f"{style(BOX_VL, C.CYAN, C.BOLD)}{title:<{W}}{style(BOX_VL, C.CYAN, C.BOLD)}")
+    print(f"{style(mid, C.CYAN, C.BOLD)}")
 
     def pad_flag(label: str, color: str, num: Optional[int] = None) -> str:
         if num is not None:
@@ -1596,35 +1888,9 @@ def print_summary(
 
     for name, st, t in summary:
         t_str = fmt_time(t).rjust(6)
-
-        if st.get("error"):
-            flag = pad_flag("FAULT", C.RED)
-        elif st.get("audio_failed"):
-            flag = pad_flag("AUDIO_FAIL", C.RED)
-        elif st.get("skipped"):
-            flag = pad_flag("SKIPPED", C.YELLOW)
-        elif st.get("reused_all"):
-            flag = pad_flag("REUSED", C.GREEN)
-        elif st.get("translated") and st.get("muxed"):
-            flag = pad_flag("DONE_TRN", C.GREEN)
-        elif st.get("mixed_language") and st.get("muxed"):
-            flag = pad_flag("MIXED", C.YELLOW, num=st.get("fallback_count", 0))
-        elif st.get("reused_srt") and st.get("muxed"):
-            flag = pad_flag("DONE_MUX", C.GREEN)
-        elif st.get("transcribed") and (st.get("translated") or st.get("mixed_language")):
-            if st.get("mixed_language"):
-                flag = pad_flag("TXT+MIX", C.CYAN, num=st.get("fallback_count", 0))
-            else:
-                flag = pad_flag("TXT+TRN", C.CYAN)
-        elif st.get("transcribed"):
-            flag = pad_flag("TXT_ONLY", C.CYAN)
-        elif st.get("translated") or st.get("reused_srt") or st.get("mixed_language"):
-            if st.get("mixed_language"):
-                flag = pad_flag("MIX_TRN", C.CYAN, num=st.get("fallback_count", 0))
-            else:
-                flag = pad_flag("TRN_ONLY", C.CYAN)
-        else:
-            flag = pad_flag("NO-OP", C.DIM)
+        
+        label, color, num = _determine_flag(st)
+        flag = pad_flag(label, color, num)
 
         flag_raw = strip_ansi(flag)
         name_width = max(20, W - 2 - len(flag_raw) - 1 - len(t_str) - 1)
@@ -1633,9 +1899,9 @@ def print_summary(
         else:
             name_trunc = name.ljust(name_width)
 
-        print(f"{BOX_VL}  {flag} {name_trunc} {t_str} {BOX_VL}")
+        print(f"{style(BOX_VL, C.CYAN, C.BOLD)}  {flag} {name_trunc} {t_str} {style(BOX_VL, C.CYAN, C.BOLD)}")
 
-    print(f"{C.BOLD}{C.CYAN}{bot}{C.RESET}")
+    print(f"{style(bot, C.CYAN, C.BOLD)}")
 
     if getattr(args, "verbose_summary", False):
         print(
@@ -1644,26 +1910,26 @@ def print_summary(
         )
         for name, st, t in summary:
             details: List[str] = []
-            if st.get("error"):
+            if st.error:
                 details.append("Execution encountered system errors.")
-            if st.get("audio_failed"):
+            if st.audio_failed:
                 details.append("Audio preprocessing/extraction failed completely.")
-            if st.get("skipped"):
+            if st.skipped:
                 details.append("Health check failed; file skipped.")
-            if st.get("reused_all"):
+            if st.reused_all:
                 details.append("Output file already exists; skipped rerun.")
-            if st.get("transcribed"):
+            if st.transcribed:
                 details.append("Transcribed audio using local Whisper engine.")
-            if st.get("translated"):
+            if st.translated:
                 details.append("Translated subtitles using translation API.")
-            if st.get("mixed_language"):
+            if st.mixed_language:
                 details.append(
-                    f"Completed with {st.get('fallback_count', 0)} likely fallback "
+                    f"Completed with {st.fallback_count} likely fallback "
                     f"blocks matching original dialogue."
                 )
-            if st.get("reused_srt"):
+            if st.reused_srt:
                 details.append("Reused existing source subtitles.")
-            if st.get("muxed"):
+            if st.muxed:
                 details.append("Muxed tracks into video container.")
             print(
                 f"  * {name:<30} -> "
@@ -1687,9 +1953,416 @@ def print_summary(
 
 
 # ════════════════════════════════════════════════════════════
+#  TRANSLATION PROVIDER ENVELOPE BUILDERS
+# ════════════════════════════════════════════════════════════
+def _build_gemini_payload(model: str, prompt_or_list: Union[str, List[str]], api_key: str, url_override: str) -> Tuple[str, bytes, Dict[str, str]]:
+    req_url = url_override.strip() if url_override else GEMINI_URL_TEMPLATE.format(model=model, key=api_key)
+    if url_override and "?" not in req_url:
+        req_url = f"{req_url}?key={api_key}"
+    payload_dict = {"contents": [{"parts": [{"text": prompt_or_list}]}]}
+    headers = {"Content-Type": "application/json"}
+    return req_url, json.dumps(payload_dict).encode("utf-8"), headers
+
+
+def _build_openai_payload(model: str, prompt_or_list: Union[str, List[str]], api_key: str, url_override: str, tgt_lang: str) -> Tuple[str, bytes, Dict[str, str]]:
+    req_url = url_override.strip() if url_override else "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    payload_dict = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    f"You are a professional translator specializing in film subtitles. "
+                    f"Translate the provided blocks accurately to {tgt_lang}. "
+                    "Do not output conversational text or wrapper blocks. Maintain raw format: 'Block #[ID]: [translation]'"
+                )
+            },
+            {"role": "user", "content": prompt_or_list}
+        ],
+        "temperature": 0.3
+    }
+    return req_url, json.dumps(payload_dict).encode("utf-8"), headers
+
+
+def _build_anthropic_payload(model: str, prompt_or_list: Union[str, List[str]], api_key: str, url_override: str, tgt_lang: str) -> Tuple[str, bytes, Dict[str, str]]:
+    req_url = url_override.strip() if url_override else "https://api.anthropic.com/v1/messages"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "Anthropic-Version": "2023-06-01"
+    }
+    payload_dict = {
+        "model": model,
+        "max_tokens": 4000,
+        "messages": [
+            {"role": "user", "content": f"You are a professional translator. Translate these blocks to {tgt_lang}. Maintain raw formats. Only output translated blocks formatted as 'Block #[ID]: [translated_text]':\n\n{prompt_or_list}"}
+        ],
+        "temperature": 0.3
+    }
+    return req_url, json.dumps(payload_dict).encode("utf-8"), headers
+
+
+def _build_deepl_payload(model: str, prompt_or_list: Union[str, List[str]], api_key: str, url_override: str, tgt_ext: str) -> Tuple[str, bytes, Dict[str, str]]:
+    req_url = url_override.strip() if url_override else ("https://api-free.deepl.com/v2/translate" if api_key.endswith(":fx") else "https://api.deepl.com/v2/translate")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"DeepL-Auth-Key {api_key}"
+    }
+    lang_upper = tgt_ext.upper()
+    if lang_upper == "EN":
+        lang_upper = "EN-US"
+    elif lang_upper == "PT":
+        lang_upper = "PT-BR"
+    payload_dict = {
+        "text": prompt_or_list,
+        "target_lang": lang_upper
+    }
+    return req_url, json.dumps(payload_dict).encode("utf-8"), headers
+
+
+def _build_google_payload(prompt_or_list: Union[str, List[str]], url_override: str, tgt_ext: str) -> Tuple[str, bytes, Dict[str, str]]:
+    req_url = url_override.strip() if url_override else f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tgt_ext}&dt=t"
+    joined_text = "\n###\n".join(prompt_or_list)
+    payload_dict = {"q": joined_text}
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    payload = urllib.parse.urlencode(payload_dict).encode("utf-8")
+    return req_url, payload, headers
+
+
+# ════════════════════════════════════════════════════════════
+#  TRANSLATION MOTOR MODULES
+# ════════════════════════════════════════════════════════════
+def _execute_translator_request(
+    translator: str,
+    model: str,
+    url_override: str,
+    api_key: str,
+    prompt_or_list: Union[str, List[str]],
+    tgt_lang: str,
+    tgt_ext: str,
+) -> Union[str, Dict[int, str]]:
+    """Execute raw HTTP request targeting the selected translation provider with fallbacks."""
+    translator = translator.lower().strip()
+    supported_translators = {"gemini", "openai", "anthropic", "deepl", "google"}
+    if translator not in supported_translators:
+        raise ValueError(f"Unsupported translator provider choice: {translator}")
+
+    if not global_rate_limiter.acquire(timeout=30):
+        raise RuntimeError("API request blocked: Rate limiter token acquisition timeout.")
+
+    success = False
+    response_text = ""
+    translated_map: Dict[int, str] = {}
+
+    ssl_context = None
+    try:
+        if _CERTIFI_AVAILABLE and certifi:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+
+    for attempt in range(MAX_TRANSLATION_CHUNK_RETRIES):
+        try:
+            if translator == "gemini":
+                req_url, payload, headers = _build_gemini_payload(model, prompt_or_list, api_key, url_override)
+            elif translator == "openai":
+                req_url, payload, headers = _build_openai_payload(model, prompt_or_list, api_key, url_override, tgt_lang)
+            elif translator == "anthropic":
+                req_url, payload, headers = _build_anthropic_payload(model, prompt_or_list, api_key, url_override, tgt_lang)
+            elif translator == "deepl":
+                req_url, payload, headers = _build_deepl_payload(model, prompt_or_list, api_key, url_override, tgt_ext)
+            elif translator == "google":
+                req_url, payload, headers = _build_google_payload(prompt_or_list, url_override, tgt_ext)
+
+            headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SubsPipeline/1.3"
+
+            req = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT, context=ssl_context) as response:
+                resp_bytes = response.read()
+                if response.info().get("Content-Encoding") == "gzip":
+                    resp_bytes = gzip.decompress(resp_bytes)
+                resp_decoded = resp_bytes.decode("utf-8", errors="replace")
+
+                if translator == "google":
+                    resp_data = json.loads(resp_decoded)
+                    segments = resp_data[0] if resp_data and isinstance(resp_data, list) else []
+                    parts_translated = []
+                    if segments:
+                        for segment in segments:
+                            if segment and isinstance(segment, list) and len(segment) > 0 and segment[0]:
+                                parts_translated.append(segment[0])
+                    
+                    stitched_translation = "".join(parts_translated)
+                    split_pattern = re.compile(r"\s*#\s*#\s*#\s*")
+                    parts = split_pattern.split(stitched_translation)
+                    
+                    for idx, part in enumerate(parts):
+                        translated_map[idx] = part.strip()
+                    success = True
+                else:
+                    resp_data = json.loads(resp_decoded)
+                    if translator == "gemini":
+                        candidates = resp_data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                response_text = parts[0].get("text", "")
+                                if response_text.strip():
+                                    success = True
+                    elif translator == "openai":
+                        choices = resp_data.get("choices", [])
+                        if choices:
+                            response_text = choices[0].get("message", {}).get("content", "")
+                            if response_text.strip():
+                                success = True
+                    elif translator == "anthropic":
+                        content_list = resp_data.get("content", [])
+                        if content_list:
+                            response_text = content_list[0].get("text", "")
+                            if response_text.strip():
+                                success = True
+                    elif translator == "deepl":
+                        translations = resp_data.get("translations", [])
+                        if translations:
+                            for idx, item in enumerate(translations):
+                                translated_map[idx] = item.get("text", "")
+                            success = True
+
+                if success:
+                    Context.reset_consecutive_429s()
+                    Context.reset_consecutive_total_failures()
+                    break
+
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and model != FALLBACK_MODELS.get(translator):
+                fallback = FALLBACK_MODELS.get(translator)
+                if fallback:
+                    logger.warning("API returned 400. Attempting fallback model: %s", fallback)
+                    model = fallback
+                    time.sleep(TRANSLATION_RETRY_BASE_DELAY)
+                    continue
+
+            if e.code == 429:
+                Context.increment_consecutive_429s()
+                if Context.get_consecutive_429s() >= CONSECUTIVE_429_LIMIT:
+                    Context.set_translation_disabled(True)
+                    raise TranslationError("Rate limits (429) hit consecutively. Suspending API translation.")
+                time.sleep(5 * attempt + 5)
+            elif e.code == 503:
+                logger.warning("Transient backend error 503 received. Retrying with delay...")
+                if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
+                    Context.increment_consecutive_total_failures()
+                    raise TranslationError(f"API Request failed after retries with HTTP Error {e.code}.")
+                time.sleep(TRANSLATION_RETRY_BASE_DELAY * (3**attempt) + random.uniform(1, 3))
+            elif e.code >= 500:
+                logger.warning("Transient backend error %d received. Retrying...", e.code)
+                if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
+                    Context.increment_consecutive_total_failures()
+                    raise TranslationError(f"API Request failed after retries with HTTP Error {e.code}")
+                time.sleep(TRANSLATION_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1))
+            else:
+                Context.increment_consecutive_total_failures()
+                raise TranslationError(f"API Request failed with HTTP Error {e.code}")
+        except urllib.error.URLError as e:
+            logger.warning("Connection failure encountered: %s. Retrying...", e.reason)
+            if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
+                Context.increment_consecutive_total_failures()
+                raise TranslationError(f"API Request failed after retries with URLError: {e.reason}")
+            time.sleep(TRANSLATION_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1))
+        except Exception as e:
+            logger.warning("Unexpected error during API request: %s. Retrying...", e)
+            if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
+                Context.increment_consecutive_total_failures()
+                raise TranslationError(f"API Request failed after retries with unexpected error: {e}")
+            time.sleep(TRANSLATION_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1))
+
+    if not success:
+        raise TranslationError("API translation request sequence exhausted without retrieving structured data.")
+
+    return translated_map if translator in ("deepl", "google") else response_text
+
+
+def _parse_translation_response(response_text: str) -> Dict[int, str]:
+    """Parse output text back into structured layout components mapping IDs to text with regex boundary isolation."""
+    parsed_translations: Dict[int, str] = {}
+    if response_text.strip():
+        # Match "Block #ID:" or similar specific pattern cleanly, preventing split errors on text matching "Block"
+        parts = re.split(r"Block\s*(?:#|No\s*|\s)\s*(\d+)\s*:?", response_text, flags=re.IGNORECASE)
+        
+        if len(parts) >= 3:
+            for idx in range(1, len(parts), 2):
+                try:
+                    b_num = int(parts[idx])
+                    body = parts[idx + 1].strip() if idx + 1 < len(parts) else ""
+                    parsed_translations[b_num] = body
+                except ValueError:
+                    pass
+        else:
+            # Fallback to lines parsing if the regex split pattern did not match correctly
+            for part in re.split(r"Block\s*(?:#|No\s*|\s)\s*", response_text, flags=re.IGNORECASE):
+                part = part.strip()
+                if not part:
+                    continue
+                lines = part.splitlines()
+                header = lines[0] if lines else ""
+                m = re.match(r"^(\d+):?", header)
+                if m:
+                    b_num = int(m.group(1))
+                    body = "\n".join(lines[1:]) if len(lines) > 1 else ""
+                    if body.startswith(":"):
+                        body = body[1:].strip()
+                    parsed_translations[b_num] = body.strip()
+    return parsed_translations
+
+
+def translate_srt_native(
+    srt_src: Union[str, Path],
+    srt_tgt: Union[str, Path],
+    tgt_lang: str,
+    api_key: str,
+    translator: str = "gemini",
+    translation_model: Optional[str] = None,
+    api_url: str = "",
+    fallback_match_threshold: float = 0.95,
+    tgt_ext: str = "en",
+    src_lang: Optional[str] = None,
+) -> Tuple[bool, str, int]:
+    """Translate an SRT file using the selected translation router API."""
+    srt_src = Path(srt_src)
+    srt_tgt = Path(srt_tgt)
+
+    is_valid, reason = is_valid_srt(srt_src)
+    if not is_valid:
+        return False, f"Source SRT validation failed: {reason}", 0
+
+    try:
+        content = srt_src.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        return False, f"Read error: {e}", 0
+
+    blocks = [b.strip() for b in re.split(r"\n\n+", content.strip()) if b.strip()]
+    if not blocks:
+        return False, "Empty SRT file.", 0
+
+    translator = translator.lower().strip()
+    
+    if translator != "google":
+        key_valid, key_err = validate_api_key(api_key)
+        if not key_valid:
+            return False, f"Invalid API key: {key_err}", 0
+
+    model = translation_model or (
+        "gemini-3.5-flash" if translator == "gemini" else
+        "gpt-4o-mini" if translator == "openai" else
+        "claude-haiku-4-5" if translator == "anthropic" else
+        "google-v1-free" if translator == "google" else
+        "deepl-translator"
+    )
+
+    chunk_size = GEMINI_CHUNK_SIZE
+    
+    # Character-length aware chunk allocation to protect provider contexts
+    chunks: List[List[str]] = []
+    current_chunk: List[str] = []
+    current_chars = 0
+    
+    for b in blocks:
+        b_len = len(b)
+        if len(current_chunk) >= chunk_size or (current_chars + b_len > MAX_CHUNK_CHAR_LIMIT and current_chunk):
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_chars = 0
+        current_chunk.append(b)
+        current_chars += b_len
+        
+    if current_chunk:
+        chunks.append(current_chunk)
+        
+    total_chunks = len(chunks)
+    tmp_tgt = srt_tgt.with_suffix(".tmp")
+    translated_count = 0
+
+    try:
+        # Use temp_file_guard for guaranteed automatic cleanup of tmp_tgt
+        with temp_file_guard(tmp_tgt) as guarded_tmp:
+            with open(guarded_tmp, "w", encoding="utf-8") as tmp_fh:
+
+                for chunk_idx, chunk in enumerate(chunks, 1):
+                    qprint(
+                        f"  {style('[~]', C.DIM)} Translating chunk {chunk_idx}/{total_chunks} "
+                        f"({len(chunk)} blocks) using {translator.upper()}...{C.RESET}"
+                    )
+
+                    if translator in ("deepl", "google"):
+                        diags = []
+                        for b in chunk:
+                            lines = b.splitlines()
+                            diag = "\n".join(lines[2:]) if len(lines) >= 3 else ""
+                            diags.append(diag)
+                        try:
+                            translated_dict = _execute_translator_request(
+                                translator, model, api_url, api_key, diags, tgt_lang, tgt_ext
+                            )
+                        except Exception as api_err:
+                            return False, f"{translator.upper()} translation chunk {chunk_idx}/{total_chunks} failed: {api_err}", 0
+                    else:
+                        prompt = _prepare_translation_prompt(chunk, tgt_lang)
+                        try:
+                            response_text = _execute_translator_request(
+                                translator, model, api_url, api_key, prompt, tgt_lang, tgt_ext
+                            )
+                            translated_dict = _parse_translation_response(response_text)
+                        except Exception as api_err:
+                            return False, f"Translation chunk {chunk_idx}/{total_chunks} failed: {api_err}", 0
+
+                    for idx_in_chunk, b in enumerate(chunk):
+                        lines = b.splitlines()
+                        if not lines:
+                            continue
+                        b_idx = int(lines[0]) if lines[0].isdigit() else (translated_count + 1)
+                        ts = (
+                            lines[1]
+                            if len(lines) >= 2
+                            else "00:00:00,000 --> 00:00:00,000"
+                        )
+
+                        orig_diag = "\n".join(lines[2:]) if len(lines) >= 3 else ""
+                        
+                        if translator in ("deepl", "google"):
+                            translated_diag = translated_dict.get(idx_in_chunk, orig_diag)
+                        else:
+                            translated_diag = translated_dict.get(b_idx, orig_diag)
+
+                        if not translated_diag.strip() and orig_diag.strip():
+                            translated_diag = orig_diag
+
+                        tmp_fh.write(f"{b_idx}\n{ts}\n{translated_diag}\n\n")
+                        translated_count += 1
+
+                    if chunk_idx < total_chunks:
+                        time.sleep(GEMINI_INTER_CHUNK_DELAY)
+
+            os.replace(str(guarded_tmp), str(srt_tgt))
+
+        fallbacks, _ = detect_fallbacks(srt_src, srt_tgt, fallback_match_threshold, lang_code=(src_lang or "en"))
+        return True, "Success", fallbacks
+
+    except KeyboardInterrupt:
+        logger.warning("Translation interrupted by user")
+        return False, "Translation interrupted by user", 0
+    except Exception as e:
+        logger.error("Translation error: %s", e)
+        return False, f"Write error: {e}", 0
+
+
+# ════════════════════════════════════════════════════════════
 #  DIRECTORY WATCHER
 # ════════════════════════════════════════════════════════════
-def run_watcher(args: argparse.Namespace) -> None:
+def run_watcher(args: PipelineConfig) -> None:
     """Run a filesystem watcher for automatic processing of new media files."""
     try:
         from watchdog.observers import Observer
@@ -1700,13 +2373,12 @@ def run_watcher(args: argparse.Namespace) -> None:
 
     in_flight: Dict[Path, float] = {}
     lock = threading.Lock()
-    muxed_folder = f"muxed_{args.tgt_ext}"
     folder_root = Path(args.folder).resolve()
 
     def clean_expired_in_flight() -> None:
         now = time.monotonic()
         for path_obj, ts in list(in_flight.items()):
-            if now - ts > 1800:  # Expire stale lock files after 30 minutes
+            if now - ts > WATCHER_IN_FLIGHT_EXPIRY:  # Expire stale lock files
                 in_flight.pop(path_obj, None)
 
     class WatchHandler(FileSystemEventHandler):
@@ -1824,7 +2496,7 @@ class TokenBucketRateLimiter:
             if deadline is not None and time.monotonic() >= deadline:
                 return False
 
-            time.sleep(0.05)
+            time.sleep(RATE_LIMITER_POLL_INTERVAL)
 
 
 # Global rate limiter: max 1 request per second with burst of 2
@@ -1832,429 +2504,31 @@ global_rate_limiter = TokenBucketRateLimiter(rate=1.0, capacity=2)
 
 
 # ════════════════════════════════════════════════════════════
-#  TRANSLATION MOTOR MODULES
-# ════════════════════════════════════════════════════════════
-def _prepare_translation_prompt(chunk: List[str], tgt_lang: str) -> str:
-    """Compile the API system instructions and text content for a block chunk."""
-    prompt_lines: List[str] = []
-    for b in chunk:
-        lines = b.splitlines()
-        idx = lines[0] if lines else str(len(prompt_lines) + 1)
-        diag = "\n".join(lines[2:]) if len(lines) >= 3 else ""
-        prompt_lines.append(f"Block #{idx}:\n{diag}")
-
-    instruction = (
-        f"Translate the following dialogue blocks to {tgt_lang}. "
-        "Maintain the block IDs exactly. Preserve styling tags like <i> and </i>. "
-        "Do not translate names or sound cues in brackets if they should remain native, "
-        "but convert everything else naturally. Output ONLY translated blocks with matching IDs, "
-        "with no extra conversational intro or outro text. Format exactly like "
-        "'Block #[ID]: [translation]'\n\n"
-    )
-    return instruction + "\n\n".join(prompt_lines)
-
-
-def _execute_translator_request(
-    translator: str,
-    model: str,
-    url_override: str,
-    api_key: str,
-    prompt_or_list: Union[str, List[str]],
-    tgt_lang: str,
-    tgt_ext: str,
-) -> Union[str, Dict[int, str]]:
-    """Execute raw HTTP request targeting the selected translation provider with fallbacks."""
-    translator = translator.lower().strip()
-    supported_translators = {"gemini", "openai", "anthropic", "deepl", "google"}
-    if translator not in supported_translators:
-        raise ValueError(f"Unsupported translator provider choice: {translator}")
-
-    if not global_rate_limiter.acquire(timeout=30):
-        raise RuntimeError("API request blocked: Rate limiter token acquisition timeout.")
-
-    url = url_override.strip() if url_override else ""
-    success = False
-    response_text = ""
-    translated_map: Dict[int, str] = {}
-
-    # Define robust SSL contexts for packaged environments
-    ssl_context = None
-    try:
-        if "certifi" in sys.modules:
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        pass
-
-    for attempt in range(MAX_TRANSLATION_CHUNK_RETRIES):
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        method = "POST"
-        payload_dict: Dict[str, Any] = {}
-        req_url = ""
-        payload = b""
-
-        if translator == "gemini":
-            req_url = url if url else GEMINI_URL_TEMPLATE.format(model=model, key=api_key)
-            if url and "?" not in req_url:
-                req_url = f"{req_url}?key={api_key}"
-            payload_dict = {"contents": [{"parts": [{"text": prompt_or_list}]}]}
-            payload = json.dumps(payload_dict).encode("utf-8")
-
-        elif translator == "openai":
-            req_url = url if url else "https://api.openai.com/v1/chat/completions"
-            headers["Authorization"] = f"Bearer {api_key}"
-            payload_dict = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            f"You are a professional translator specializing in film subtitles. "
-                            f"Translate the provided blocks accurately to {tgt_lang}. "
-                            "Do not output conversational text or wrapper blocks. Maintain raw format: 'Block #[ID]: [translation]'"
-                        )
-                    },
-                    {"role": "user", "content": prompt_or_list}
-                ],
-                "temperature": 0.3
-            }
-            payload = json.dumps(payload_dict).encode("utf-8")
-
-        elif translator == "anthropic":
-            req_url = url if url else "https://api.anthropic.com/v1/messages"
-            headers["x-api-key"] = api_key
-            headers["Anthropic-Version"] = "2023-06-01"
-            payload_dict = {
-                "model": model,
-                "max_tokens": 4000,
-                "messages": [
-                    {"role": "user", "content": f"You are a professional translator. Translate these blocks to {tgt_lang}. Maintain raw formats. Only output translated blocks formatted as 'Block #[ID]: [translated_text]':\n\n{prompt_or_list}"}
-                ],
-                "temperature": 0.3
-            }
-            payload = json.dumps(payload_dict).encode("utf-8")
-
-        elif translator == "deepl":
-            req_url = url if url else ("https://api-free.deepl.com/v2/translate" if api_key.endswith(":fx") else "https://api.deepl.com/v2/translate")
-            headers["Authorization"] = f"DeepL-Auth-Key {api_key}"
-            
-            lang_upper = tgt_ext.upper()
-            if lang_upper == "EN":
-                lang_upper = "EN-US"
-            elif lang_upper == "PT":
-                lang_upper = "PT-BR"
-                
-            payload_dict = {
-                "text": prompt_or_list,
-                "target_lang": lang_upper
-            }
-            payload = json.dumps(payload_dict).encode("utf-8")
-
-        elif translator == "google":
-            logger.warning("Using unofficial Google Translate endpoint. This free API key-less endpoint can change or be restricted without notice.")
-            req_url = url if url else f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tgt_ext}&dt=t"
-            joined_text = "\n###\n".join(prompt_or_list)
-            payload_dict = {"q": joined_text}
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-            payload = urllib.parse.urlencode(payload_dict).encode("utf-8")
-
-        try:
-            req = urllib.request.Request(req_url, data=payload, headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT, context=ssl_context) as response:
-                
-                # Dynamic Gzip decompression support
-                resp_bytes = response.read()
-                if response.info().get("Content-Encoding") == "gzip":
-                    resp_bytes = gzip.decompress(resp_bytes)
-                resp_decoded = resp_bytes.decode("utf-8", errors="replace")
-                
-                if translator == "google":
-                    resp_data = json.loads(resp_decoded)
-                    segments = resp_data[0] if resp_data and isinstance(resp_data, list) else []
-                    parts_translated = []
-                    if segments:
-                        for segment in segments:
-                            if segment and isinstance(segment, list) and len(segment) > 0 and segment[0]:
-                                parts_translated.append(segment[0])
-                    
-                    stitched_translation = "".join(parts_translated)
-                    split_pattern = re.compile(r"\s*#\s*#\s*#\s*")
-                    parts = split_pattern.split(stitched_translation)
-                    
-                    for idx, part in enumerate(parts):
-                        translated_map[idx] = part.strip()
-                    success = True
-                else:
-                    resp_data = json.loads(resp_decoded)
-                    
-                    if translator == "gemini":
-                        candidates = resp_data.get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            if parts:
-                                response_text = parts[0].get("text", "")
-                                if response_text.strip():
-                                    success = True
-                    
-                    elif translator == "openai":
-                        choices = resp_data.get("choices", [])
-                        if choices:
-                            response_text = choices[0].get("message", {}).get("content", "")
-                            if response_text.strip():
-                                success = True
-                                
-                    elif translator == "anthropic":
-                        content_list = resp_data.get("content", [])
-                        if content_list:
-                            response_text = content_list[0].get("text", "")
-                            if response_text.strip():
-                                success = True
-
-                    elif translator == "deepl":
-                        translations = resp_data.get("translations", [])
-                        if translations:
-                            for idx, item in enumerate(translations):
-                                translated_map[idx] = item.get("text", "")
-                            success = True
-
-                if success:
-                    Context.reset_consecutive_429s()
-                    Context.reset_consecutive_total_failures()
-                    break
-
-        except urllib.error.HTTPError as e:
-            # Model API Fallback for 400 Bad Request
-            if e.code == 400 and model != FALLBACK_MODELS.get(translator):
-                fallback = FALLBACK_MODELS.get(translator)
-                if fallback:
-                    logger.warning("API returned 400. Attempting fallback model: %s", fallback)
-                    model = fallback
-                    time.sleep(TRANSLATION_RETRY_BASE_DELAY)
-                    continue
-
-            if e.code == 429:
-                Context.increment_consecutive_429s()
-                if Context.get_consecutive_429s() >= CONSECUTIVE_429_LIMIT:
-                    Context.set_translation_disabled(True)
-                    raise RuntimeError("Rate limits (429) hit consecutively. Suspending API translation.")
-                time.sleep(5 * attempt + 5)
-            elif e.code == 503:
-                logger.warning("Transient backend error 503 received. Retrying with delay...")
-                if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
-                    Context.increment_consecutive_total_failures()
-                    raise RuntimeError(f"API Request failed after retries with HTTP Error {e.code}.")
-                time.sleep(TRANSLATION_RETRY_BASE_DELAY * (3**attempt) + random.uniform(1, 3))
-            elif e.code >= 500:
-                logger.warning("Transient backend error %d received. Retrying...", e.code)
-                if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
-                    Context.increment_consecutive_total_failures()
-                    raise RuntimeError(f"API Request failed after retries with HTTP Error {e.code}")
-                time.sleep(TRANSLATION_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1))
-            else:
-                Context.increment_consecutive_total_failures()
-                raise RuntimeError(f"API Request failed with HTTP Error {e.code}")
-        except urllib.error.URLError as e:
-            logger.warning("Connection failure encountered: %s. Retrying...", e.reason)
-            if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
-                Context.increment_consecutive_total_failures()
-                raise RuntimeError(f"API Request failed after retries with URLError: {e.reason}")
-            time.sleep(TRANSLATION_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1))
-        except Exception as e:
-            logger.warning("Unexpected error during API request: %s. Retrying...", e)
-            if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
-                Context.increment_consecutive_total_failures()
-                raise RuntimeError(f"API Request failed after retries with unexpected error: {e}")
-            time.sleep(TRANSLATION_RETRY_BASE_DELAY * (2**attempt) + random.uniform(0, 1))
-
-    if not success:
-        raise RuntimeError("API translation request sequence exhausted without retrieving structured data.")
-
-    return translated_map if translator in ("deepl", "google") else response_text
-
-
-def _parse_translation_response(response_text: str) -> Dict[int, str]:
-    """Parse output text back into structured layout components mapping IDs to text with regex boundary isolation."""
-    parsed_translations: Dict[int, str] = {}
-    if response_text.strip():
-        # Match "Block #ID:" or similar specific pattern cleanly, preventing split errors on text matching "Block"
-        parts = re.split(r"Block\s*(?:#|No\s*|\s)\s*(\d+)\s*:?", response_text, flags=re.IGNORECASE)
-        
-        if len(parts) >= 3:
-            for idx in range(1, len(parts), 2):
-                try:
-                    b_num = int(parts[idx])
-                    body = parts[idx + 1].strip() if idx + 1 < len(parts) else ""
-                    parsed_translations[b_num] = body
-                except ValueError:
-                    pass
-        else:
-            # Fallback to lines parsing if the regex split pattern did not match correctly
-            for part in re.split(r"Block\s*(?:#|No\s*|\s)\s*", response_text, flags=re.IGNORECASE):
-                part = part.strip()
-                if not part:
-                    continue
-                lines = part.splitlines()
-                header = lines[0] if lines else ""
-                m = re.match(r"^(\d+):?", header)
-                if m:
-                    b_num = int(m.group(1))
-                    body = "\n".join(lines[1:]) if len(lines) > 1 else ""
-                    if body.startswith(":"):
-                        body = body[1:].strip()
-                    parsed_translations[b_num] = body.strip()
-    return parsed_translations
-
-
-def translate_srt_native(
-    srt_src: Union[str, Path],
-    srt_tgt: Union[str, Path],
-    tgt_lang: str,
-    api_key: str,
-    translator: str = "gemini",
-    translation_model: Optional[str] = None,
-    api_url: str = "",
-    fallback_match_threshold: float = 0.95,
-    tgt_ext: str = "en",
-) -> Tuple[bool, str, int]:
-    """Translate an SRT file using the selected translation router API."""
-    srt_src = Path(srt_src)
-    srt_tgt = Path(srt_tgt)
-
-    is_valid, reason = is_valid_srt(srt_src)
-    if not is_valid:
-        return False, f"Source SRT validation failed: {reason}", 0
-
-    try:
-        content = srt_src.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        return False, f"Read error: {e}", 0
-
-    blocks = [b.strip() for b in re.split(r"\n\n+", content.strip()) if b.strip()]
-    if not blocks:
-        return False, "Empty SRT file.", 0
-
-    translator = translator.lower().strip()
-    
-    if translator != "google":
-        key_valid, key_err = validate_api_key(api_key)
-        if not key_valid:
-            return False, f"Invalid API key: {key_err}", 0
-
-    model = translation_model or (
-        "gemini-3.5-flash" if translator == "gemini" else
-        "gpt-4o-mini" if translator == "openai" else
-        "claude-haiku-4-5" if translator == "anthropic" else
-        "google-v1-free" if translator == "google" else
-        "deepl-translator"
-    )
-
-    chunk_size = GEMINI_CHUNK_SIZE
-    total_chunks = (len(blocks) + chunk_size - 1) // chunk_size
-
-    tmp_tgt = srt_tgt.with_suffix(".tmp")
-    translated_count = 0
-
-    try:
-        # Use temp_file_guard for guaranteed automatic cleanup of tmp_tgt
-        with temp_file_guard(tmp_tgt) as guarded_tmp:
-            with open(guarded_tmp, "w", encoding="utf-8") as tmp_fh:
-
-                for i in range(0, len(blocks), chunk_size):
-                    chunk = blocks[i : i + chunk_size]
-                    chunk_idx = (i // chunk_size) + 1
-
-                    qprint(
-                        f"  {C.DIM}[~] Translating chunk {chunk_idx}/{total_chunks} "
-                        f"({len(chunk)} blocks) using {translator.upper()}...{C.RESET}"
-                    )
-
-                    if translator in ("deepl", "google"):
-                        diags = []
-                        for b in chunk:
-                            lines = b.splitlines()
-                            diag = "\n".join(lines[2:]) if len(lines) >= 3 else ""
-                            diags.append(diag)
-                        try:
-                            translated_dict = _execute_translator_request(
-                                translator, model, api_url, api_key, diags, tgt_lang, tgt_ext
-                            )
-                        except Exception as api_err:
-                            return False, f"{translator.upper()} translation chunk {chunk_idx}/{total_chunks} failed: {api_err}", 0
-                    else:
-                        prompt = _prepare_translation_prompt(chunk, tgt_lang)
-                        try:
-                            response_text = _execute_translator_request(
-                                translator, model, api_url, api_key, prompt, tgt_lang, tgt_ext
-                            )
-                            translated_dict = _parse_translation_response(response_text)
-                        except Exception as api_err:
-                            return False, f"Translation chunk {chunk_idx}/{total_chunks} failed: {api_err}", 0
-
-                    for idx_in_chunk, b in enumerate(chunk):
-                        lines = b.splitlines()
-                        if not lines:
-                            continue
-                        b_idx = int(lines[0]) if lines[0].isdigit() else (i + idx_in_chunk + 1)
-                        ts = (
-                            lines[1]
-                            if len(lines) >= 2
-                            else "00:00:00,000 --> 00:00:00,000"
-                        )
-
-                        orig_diag = "\n".join(lines[2:]) if len(lines) >= 3 else ""
-                        
-                        if translator in ("deepl", "google"):
-                            translated_diag = translated_dict.get(idx_in_chunk, orig_diag)
-                        else:
-                            translated_diag = translated_dict.get(b_idx, orig_diag)
-
-                        if not translated_diag.strip() and orig_diag.strip():
-                            translated_diag = orig_diag
-
-                        tmp_fh.write(f"{b_idx}\n{ts}\n{translated_diag}\n\n")
-                        translated_count += 1
-
-                    if chunk_idx < total_chunks:
-                        time.sleep(GEMINI_INTER_CHUNK_DELAY)
-
-            os.replace(str(guarded_tmp), str(srt_tgt))
-
-        fallbacks, _ = detect_fallbacks(srt_src, srt_tgt, fallback_match_threshold)
-        return True, "Success", fallbacks
-
-    except KeyboardInterrupt:
-        logger.warning("Translation interrupted by user")
-        return False, "Translation interrupted by user", 0
-    except Exception as e:
-        logger.error("Translation error: %s", e)
-        return False, f"Write error: {e}", 0
-
-
-# ════════════════════════════════════════════════════════════
 #  INTERACTIVE WIZARD
 # ════════════════════════════════════════════════════════════
 def interactive_wizard(
-    args: argparse.Namespace, cfg_memory: Dict[str, Any]
+    args: PipelineConfig, cfg_memory: Dict[str, Any]
 ) -> None:
     """Run the interactive configuration wizard with API key validation checks."""
-    print(f"\n{C.CYAN}{C.BOLD}", end="")
-    print(BOX_TL + BOX_HL * 60 + BOX_TR)
-    print(BOX_VL + "  Subs Pipeline v" + __version__ + " " * 37 + BOX_VL)
-    print(BOX_BL + BOX_HL * 60 + BOX_BR + "\n")
+    print()
+    banner_lines = [
+        f"  Subs Pipeline v{__version__}",
+        "  Multi-Language Media Transcription & Translation Pipeline"
+    ]
+    print(render_box(banner_lines, 60))
+    print()
 
     print(
-        f"  {C.DIM}This utility automatically handles local multi-language "
+        f"  {style('[~]', C.DIM)} This utility automatically handles local multi-language "
         f"media pipeline runs.\n  Use the steps below to initialize models and "
-        f"folders.{C.RESET}\n"
+        f"folders.\n"
     )
 
     if Context.migration_status == "loaded":
-        print(f"  {C.GREEN}[~] Loaded saved profile settings.{C.RESET}\n")
+        print(f"  {style('[~]', C.GREEN)} Loaded saved profile settings.\n")
 
     if Context.config_warning:
-        print(f"  {C.RED}[!] CONFIG SYSTEM: {Context.config_warning}{C.RESET}\n")
+        print(f"  {style('[!]', C.RED)} CONFIG SYSTEM: {Context.config_warning}\n")
 
     if not setup_ffmpeg():
         print(f"{C.RED}  [!] FFmpeg is required to continue.{C.RESET}")
@@ -2263,7 +2537,7 @@ def interactive_wizard(
     # Step 1: Folder
     current_dir = os.getcwd()
     print(f"{C.BOLD}> Step 1: Media Directory{C.RESET}")
-    print(f"  Current: {C.CYAN}{current_dir}{C.RESET}")
+    print(f"  Current: {style(current_dir, C.CYAN)}")
     
     while True:
         f_in = input(f"  [Enter = current  |  path]: ").strip()
@@ -2278,9 +2552,9 @@ def interactive_wizard(
                 Context.provenance["folder"] = "Interactive"
                 break
             else:
-                print(f"  {C.YELLOW}[!] Path does not exist or is not a directory. Try again.{C.RESET}")
+                print(f"  {style('[!]', C.YELLOW)} Path does not exist or is not a directory. Try again.")
 
-    print(f"  {C.GREEN}-> {args.folder}{C.RESET}\n")
+    print(f"  {style('->', C.GREEN)} {args.folder}\n")
 
     startup_garbage_collection(args.folder, skip_cleanup=args.no_cleanup)
 
@@ -2288,25 +2562,24 @@ def interactive_wizard(
     if cfg_memory:
         print(f"\n{C.BOLD}> Step 2: Use Saved Settings Profile?{C.RESET}")
         print(
-            f"  Target Language:     {C.CYAN}{cfg_memory.get('tgt_lang', 'English')}{C.RESET}"
+            f"  Target Language:     {style(cfg_memory.get('tgt_lang', 'English'), C.CYAN)}"
         )
         print(
-            f"  Subtitle Extension:  {C.CYAN}{cfg_memory.get('tgt_ext', 'en')}{C.RESET}"
+            f"  Subtitle Extension:  {style(cfg_memory.get('tgt_ext', 'en'), C.CYAN)}"
         )
         print(
-            f"  Translation Service: {C.CYAN}{cfg_memory.get('translator', 'gemini').upper()}{C.RESET} "
+            f"  Translation Service: {style(cfg_memory.get('translator', 'gemini').upper(), C.CYAN)} "
             f"(Model: {cfg_memory.get('translation_model', DEFAULT_GEMINI_MODEL)})"
         )
         print(
-            f"  Min Blocks Required: {C.CYAN}{cfg_memory.get('min_blocks', 3)}{C.RESET}"
+            f"  Min Blocks Required: {style(str(cfg_memory.get('min_blocks', 3)), C.CYAN)}"
         )
         print(
-            f"  Saved Whisper Model: {C.CYAN}"
-            f"{(cfg_memory.get('model') or 'None').upper()}{C.RESET}"
+            f"  Saved Whisper Model: {style((cfg_memory.get('model') or 'None').upper(), C.CYAN)}"
         )
         args.device = cfg_memory.get("device", "auto")
         device, compute = resolve_device_and_compute(args.device)
-        print(f"  Configured Device:   {C.CYAN}{device} ({compute}){C.RESET}")
+        print(f"  Configured Device:   {style(device + ' (' + compute + ')', C.CYAN)}")
 
         fast_path = (
             input(
@@ -2335,7 +2608,7 @@ def interactive_wizard(
                     if is_valid:
                         args.api_key = env_key
                     else:
-                        qprint(f"  {C.YELLOW}[!] Ignored invalid credentials environment variable.{C.RESET}")
+                        qprint(f"  {style('[!]', C.YELLOW)} Ignored invalid credentials environment variable.")
                 
             args.translate = (bool(args.api_key) or args.translator == "google") and not getattr(args, "skip_translate", False)
             args.min_blocks = int(cfg_memory.get("min_blocks", 3))
@@ -2364,28 +2637,27 @@ def interactive_wizard(
             Context.provenance["transcribe"] = "Saved Profile"
             Context.provenance["embed"] = "Saved Profile"
 
+            resolve_pipeline_steps(args, respect_interactive=True)
+
             print(
-                f"\n  {C.CYAN}Applying Saved Configuration Profile & "
-                f"Workflow Overrides:{C.RESET}"
+                f"\n  {style('Applying Saved Configuration Profile & Workflow Overrides:', C.CYAN)}"
             )
             print(
                 f"    - Transcription:     "
-                f"{C.CYAN}{'Enabled' if args.transcribe else 'Disabled'}{C.RESET}"
+                f"{style('Enabled' if args.transcribe else 'Disabled', C.CYAN)}"
                 f"  (Model: {args.model.upper()} on {device.upper()})"
             )
             print(
                 f"    - Translation:       "
-                f"{C.CYAN}{'Enabled' if args.translate else 'Disabled'}{C.RESET}"
+                f"{style('Enabled' if args.translate else 'Disabled', C.CYAN)}"
                 f" ({args.translator.upper()} Model: {args.translation_model})"
             )
             print(
                 f"    - Final Muxing:      "
-                f"{C.CYAN}"
-                f"{'Enabled (Hardsub)' if args.hardsub else 'Enabled (Softsub)' if args.embed else 'Disabled'}"
-                f"{C.RESET}"
+                f"{style('Enabled (Hardsub)' if args.hardsub else 'Enabled (Softsub)' if args.embed else 'Disabled', C.CYAN)}"
             )
             print(
-                f"  {C.GREEN}[+] Loaded saved profile. Proceeding directly...{C.RESET}\n"
+                f"  {style('[+]', C.GREEN)} Loaded saved profile. Proceeding directly...\n"
             )
             return
 
@@ -2399,8 +2671,8 @@ def interactive_wizard(
 
     if len(args.tgt_lang) < 2 or not args.tgt_lang.replace(" ", "").replace("-", "").isalpha():
         print(
-            f"  {C.YELLOW}  [!] Warning: '{args.tgt_lang}' might not be a "
-            f"valid language name.{C.RESET}"
+            f"  {style('[!]', C.YELLOW)} Warning: '{args.tgt_lang}' might not be a "
+            f"valid language name."
         )
 
     while True:
@@ -2417,7 +2689,7 @@ def interactive_wizard(
         if valid:
             args.tgt_ext = ext_input
             break
-        print(f"  {C.YELLOW}[!] {err} Please try again.{C.RESET}")
+        print(f"  {style('[!]', C.YELLOW)} {err} Please try again.")
     Context.provenance["tgt_ext"] = "Interactive"
 
     # Step 4: Source language
@@ -2433,10 +2705,10 @@ def interactive_wizard(
     # Step 5a: Compute Device selection
     print(f"\n{C.BOLD}> Step 5a: Compute Device{C.RESET}")
     device_detected, _ = resolve_device_and_compute("auto")
-    print(f"  Detected support: {C.CYAN}{device_detected.upper()}{C.RESET}")
-    print(f"    {C.CYAN}[0]{C.RESET} Auto-detect device")
-    print(f"    {C.CYAN}[1]{C.RESET} Force CPU Mode")
-    print(f"    {C.CYAN}[2]{C.RESET} Force CUDA GPU Mode (Requires NVIDIA GPU)")
+    print(f"  Detected support: {style(device_detected.upper(), C.CYAN)}")
+    print(f"    {style('[0]', C.CYAN)} Auto-detect device")
+    print(f"    {style('[1]', C.CYAN)} Force CPU Mode")
+    print(f"    {style('[2]', C.CYAN)} Force CUDA GPU Mode (Requires NVIDIA GPU)")
 
     saved_dev = cfg_memory.get("device", "auto")
     dev_default_num = "0" if saved_dev == "auto" else "1" if saved_dev == "cpu" else "2"
@@ -2447,56 +2719,41 @@ def interactive_wizard(
     Context.provenance["device"] = "Interactive"
     
     device_resolved, compute_resolved = resolve_device_and_compute(args.device)
-    print(f"  -> Resolved Device: {C.GREEN}{device_resolved.upper()} ({compute_resolved}){C.RESET}")
+    print(f"  -> Resolved Device: {style(device_resolved.upper() + ' (' + compute_resolved + ')', C.GREEN)}")
 
     # Step 5b: Whisper model (Re-evaluated based on selected device)
     vram_avail = get_available_vram_gb() if device_resolved == "cuda" else 0.0
     vram_label = f"{vram_avail:.1f} GB free" if device_resolved == "cuda" else "CPU mode"
-    
-    if device_resolved == "cpu":
-        recommended = "1"  # "base" is a safe recommendation for CPU
-    else:
-        if vram_avail >= 10.0:
-            recommended = "5"
-        elif vram_avail >= 6.0:
-            recommended = "4"
-        elif vram_avail >= 5.0:
-            recommended = "3"
-        elif vram_avail >= 2.5:
-            recommended = "2"
-        elif vram_avail >= 1.5:
-            recommended = "1"
-        else:
-            recommended = "0"
+    recommended = get_model_recommendation(vram_avail, device_resolved == "cpu")
 
     print(
         f"\n{C.BOLD}> Step 5b: Transcription Model "
         f"(Recommended: {MODEL_MAP[recommended].upper()}){C.RESET}"
     )
     print(f"  {C.DIM}Selected Device: {device_resolved.upper()}  ({vram_label}){C.RESET}")
-    print(f"    {C.CYAN}[0]{C.RESET} Tiny           ~1.0 GB  Fastest")
-    print(f"    {C.CYAN}[1]{C.RESET} Base           ~1.5 GB  Fast")
-    print(f"    {C.CYAN}[2]{C.RESET} Small          ~2.5 GB  Recommended")
-    print(f"    {C.CYAN}[3]{C.RESET} Medium         ~5.0 GB  Better accuracy")
-    print(f"    {C.CYAN}[4]{C.RESET} Large-v3 Turbo ~6.0 GB  Fast + accurate")
-    print(f"    {C.CYAN}[5]{C.RESET} Large-v3       ~10  GB  Best accuracy")
+    print(f"    {style('[0]', C.CYAN)} Tiny           ~1.0 GB  Fastest")
+    print(f"    {style('[1]', C.CYAN)} Base           ~1.5 GB  Fast")
+    print(f"    {style('[2]', C.CYAN)} Small          ~2.5 GB  Recommended")
+    print(f"    {style('[3]', C.CYAN)} Medium         ~5.0 GB  Better accuracy")
+    print(f"    {style('[4]', C.CYAN)} Large-v3 Turbo ~6.0 GB  Fast + accurate")
+    print(f"    {style('[5]', C.CYAN)} Large-v3       ~10  GB  Best accuracy")
 
     _model_input = input(f"  Selection [{recommended}]: ").strip() or recommended
     args.model = MODEL_MAP.get(_model_input)
     if args.model is None:
-        qprint(f"  {C.YELLOW}[!] Invalid selection '{_model_input}', defaulting to 'small'.{C.RESET}")
+        qprint(f"  {style('[!]', C.YELLOW)} Invalid selection '{_model_input}', defaulting to 'small'.")
         args.model = "small"
     Context.provenance["model"] = "Interactive"
-    print(f"  {C.GREEN}-> Selected Model: {args.model.upper()}{C.RESET}")
+    print(f"  {style('->', C.GREEN)} Selected Model: {args.model.upper()}")
 
     # Step 6: Translation Service Router Choice
     saved_translator = cfg_memory.get("translator", "gemini")
     print(f"\n{C.BOLD}> Step 6: Translation Service Provider{C.RESET}")
-    print(f"    {C.CYAN}[0]{C.RESET} Gemini           (Free/Flash options)")
-    print(f"    {C.CYAN}[1]{C.RESET} OpenAI           (GPT models / Custom compatibles)")
-    print(f"    {C.CYAN}[2]{C.RESET} Anthropic        (Claude-4 models)")
-    print(f"    {C.CYAN}[3]{C.RESET} DeepL            (Dedicated plain text translation)")
-    print(f"    {C.CYAN}[4]{C.RESET} Google Translate (Free / Unofficial v1 API)")
+    print(f"    {style('[0]', C.CYAN)} Gemini           (Free/Flash options)")
+    print(f"    {style('[1]', C.CYAN)} OpenAI           (GPT models / Custom compatibles)")
+    print(f"    {style('[2]', C.CYAN)} Anthropic        (Claude-4 models)")
+    print(f"    {style('[3]', C.CYAN)} DeepL            (Dedicated plain text translation)")
+    print(f"    {style('[4]', C.CYAN)} Google Translate (Free / Unofficial v1 API)")
     
     trans_in = input(f"  Selection [{saved_translator}]: ").strip().lower()
     trans_map = {"0": "gemini", "1": "openai", "2": "anthropic", "3": "deepl", "4": "google"}
@@ -2515,7 +2772,7 @@ def interactive_wizard(
         args.translation_model = "google-v1-free"
         args.api_url = ""
         args.api_key = ""
-        qprint(f"  {C.GREEN}[~] Google Translate (Free) selected. API key and model selection bypassed.{C.RESET}")
+        qprint(f"  {style('[~]', C.GREEN)} Google Translate (Free) selected. API key and model selection bypassed.")
     else:
         saved_t_model = cfg_memory.get("translation_model") or model_defaults.get(args.translator, "gemini-3.5-flash")
         args.translation_model = input(f"  Translation Model [{saved_t_model}]: ").strip() or saved_t_model
@@ -2545,7 +2802,7 @@ def interactive_wizard(
             if valid:
                 args.api_key = key_input
                 break
-            print(f"  {C.YELLOW}[!] {err} Please try again.{C.RESET}")
+            print(f"  {style('[!]', C.YELLOW)} {err} Please try again.")
             
     args.translate = bool(args.api_key) or args.translator == "google"
     Context.provenance["api_key"] = "Interactive"
@@ -2553,8 +2810,8 @@ def interactive_wizard(
 
     # Step 8: Output format
     print(f"\n{C.BOLD}> Step 8: Output Format{C.RESET}")
-    print(f"    {C.CYAN}[0]{C.RESET} Softsub -- toggleable track  (default)")
-    print(f"    {C.CYAN}[1]{C.RESET} Hardsub -- burned into video")
+    print(f"    {style('[0]', C.CYAN)} Softsub -- toggleable track  (default)")
+    print(f"    {style('[1]', C.CYAN)} Hardsub -- burned into video")
     args.hardsub = input("  Selection [0]: ").strip() == "1"
     Context.provenance["hardsub"] = "Interactive"
 
@@ -2612,8 +2869,8 @@ def interactive_wizard(
                 Context.provenance[k] = "Interactive"
         except ValueError:
             print(
-                f"    {C.YELLOW}[!] Invalid numeric values. "
-                f"Standard defaults retained.{C.RESET}"
+                f"    {style('[!]', C.YELLOW)} Invalid numeric values. "
+                f"Standard defaults retained."
             )
     else:
         args.srt_max_avg_duration = getattr(args, "srt_max_avg_duration", cfg_memory.get("srt_max_avg_duration", 10.0))
@@ -2621,7 +2878,7 @@ def interactive_wizard(
         args.srt_dup_ratio = getattr(args, "srt_dup_ratio", cfg_memory.get("srt_dup_ratio", 0.6))
         args.fallback_match_threshold = getattr(args, "fallback_match_threshold", cfg_memory.get("fallback_match_threshold", 0.95))
 
-    # Step 11: Pipeline Steps (Interactive Wizard respects CLI skip flags)
+    # Step 11: Pipeline Steps
     print(f"\n{C.BOLD}> Step 11: Pipeline Steps{C.RESET}")
     if getattr(args, "skip_transcribe", False):
         args.transcribe = False
@@ -2647,8 +2904,8 @@ def interactive_wizard(
 
     if args.hardsub and not args.embed:
         print(
-            f"  {C.YELLOW}[!] Override: Hardsub is active. Soft muxing step "
-            f"enabled to complete burning action.{C.RESET}"
+            f"  {style('[!]', C.YELLOW)} Override: Hardsub is active. Soft muxing step "
+            f"enabled to complete burning action."
         )
         args.embed = True
         Context.provenance["embed"] = "Auto-Override"
@@ -2659,6 +2916,8 @@ def interactive_wizard(
         == "y"
     )
 
+    resolve_pipeline_steps(args, respect_interactive=True)
+
     save_config({
         "schema_version": DEFAULT_CONFIG["schema_version"],
         "api_key": args.api_key,
@@ -2668,7 +2927,7 @@ def interactive_wizard(
         "min_blocks": args.min_blocks,
         "model": args.model,
         "device": args.device,
-        "skip_cleanup": args.no_cleanup,
+        "no_cleanup": args.no_cleanup,
         "skip_migration": args.skip_migration,
         "explain_summary": args.explain_summary,
         "srt_max_avg_duration": args.srt_max_avg_duration,
@@ -2726,7 +2985,7 @@ def run_ffmpeg_hardsub(
                 abs_out,
             ]
             logger.debug("Executing local FFmpeg hardsub: %s", " ".join(cmd))
-            result = subprocess.run(cmd, capture_output=True, cwd=cwd_path, encoding="utf-8", errors="replace")
+            result = subprocess.run(cmd, capture_output=True, cwd=cwd_path, encoding="utf-8", errors="replace", timeout=FFMPEG_TRANSCODE_TIMEOUT)
             return result
     except (OSError, PermissionError) as err1:
         try:
@@ -2748,12 +3007,12 @@ def run_ffmpeg_hardsub(
                     abs_out,
                 ]
                 logger.debug("Executing alt FFmpeg hardsub: %s", " ".join(cmd))
-                result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+                result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=FFMPEG_TRANSCODE_TIMEOUT)
                 return result
         except (OSError, PermissionError) as err2:
             qprint(
-                f"  {C.RED}[x] Severe Hardsub Error: Temporary subtitle file "
-                f"could not be written.{C.RESET}"
+                f"  {style('[x]', C.RED)} Severe Hardsub Error: Temporary subtitle file "
+                f"could not be written."
             )
             qprint(f"      Workspace Error: {err1}")
             qprint(f"      System Temp Error: {err2}")
@@ -2784,7 +3043,7 @@ def verify_mux_output(path: Union[str, Path], hardsub: bool = False) -> Tuple[bo
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 str(p),
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30.0)
             logger.debug("Container structure integrity diagnostic complete: returncode %d", result.returncode)
             if result.returncode != 0:
                 err_msg = result.stderr.strip() if result.stderr else "Corrupt stream layout"
@@ -2813,8 +3072,6 @@ def verify_mux_output(path: Union[str, Path], hardsub: bool = False) -> Tuple[bo
 # ════════════════════════════════════════════════════════════
 def _extract_audio(media_path: Path, temp_audio: Path) -> bool:
     """Extract audio track to monaural PCM format at 16kHz."""
-    register_temp_file(temp_audio)
-    
     if media_path.name.startswith("-"):
         raise ValueError(f"Target media path starts with options flag parameter: {media_path}")
 
@@ -2844,12 +3101,13 @@ def _extract_audio(media_path: Path, temp_audio: Path) -> bool:
         capture_output=True,
         encoding="utf-8",
         errors="replace",
+        timeout=FFMPEG_STREAM_TIMEOUT
     )
     if result.returncode != 0 or not temp_audio.exists():
         stderr_msg = result.stderr.strip() if result.stderr else ""
-        qprint(f"  {C.RED}[x] Audio extraction failed.{C.RESET}")
+        qprint(f"  {style('[x]', C.RED)} Audio extraction failed.")
         if stderr_msg:
-            qprint(f"      {C.DIM}{stderr_msg[:500]}{C.RESET}")
+            qprint(f"      {C.DIM}{stderr_msg[:STDERR_TRUNCATION_LIMIT]}{C.RESET}")
         return False
     return True
 
@@ -2858,7 +3116,7 @@ def _transcribe_audio(
     temp_audio: Path,
     srt_src: Path,
     duration: float,
-    args: argparse.Namespace
+    args: PipelineConfig
 ) -> Tuple[bool, str]:
     """Run core transcribe functions against active audio samples."""
     transcription_success = False
@@ -2869,9 +3127,8 @@ def _transcribe_audio(
         tmp_srt = srt_src.with_suffix(".tmp")
         try:
             qprint(
-                f"  {C.CYAN}> Transcribing..."
+                f"  {style('>', C.CYAN)} Transcribing..."
                 f"{f' (attempt {attempt + 1}/{MAX_TRANSCRIPTION_RETRIES})' if attempt > 0 else ''}"
-                f"{C.RESET}"
             )
             
             lang_hint = args.src_lang if args.src_lang else None
@@ -2921,49 +3178,60 @@ def _transcribe_audio(
                 os.replace(str(guarded_tmp), str(srt_src))
 
             qprint(
-                f"\n  {C.GREEN}[+] Transcription done "
-                f"(detected: {detected_lang}){C.RESET}"
+                f"\n  {style('[+]', C.GREEN)} Transcription done "
+                f"(detected: {detected_lang})"
             )
             transcription_success = True
             break
 
         except Exception as e:
-            qprint(f"\n  {C.RED}[x] Transcription error: {e}{C.RESET}")
+            qprint(f"\n  {style('[x]', C.RED)} Transcription error: {e}")
             if attempt < MAX_TRANSCRIPTION_RETRIES - 1:
                 delay = TRANSCRIPTION_RETRY_BASE_DELAY * (2**attempt)
-                qprint(f"  {C.YELLOW}[~] Retrying in {delay:.0f}s...{C.RESET}")
+                qprint(f"  {style('[~]', C.YELLOW)} Retrying in {delay:.0f}s...")
                 time.sleep(delay)
                 perform_vram_gc()
             else:
-                qprint(
-                    f"  {C.RED}[x] All {MAX_TRANSCRIPTION_RETRIES} "
-                    f"transcription attempts failed.{C.RESET}"
-                )
+                raise TranscriptionError(f"All {MAX_TRANSCRIPTION_RETRIES} transcription attempts failed. Context error: {e}")
 
     return transcription_success, detected_lang
 
 
-def find_source_srt(media_p: Path, tgt_ext: str, src_lang: Optional[str] = None) -> Tuple[Path, str]:
-    """Locate an existing language-specific source subtitle file without glob injection."""
-    base = media_p.stem
-    if src_lang:
-        return media_p.parent / f"{base}.{src_lang}.srt", src_lang
+def wait_for_file_settle(
+    path: Union[str, Path],
+    max_retries: int = FILE_SETTLE_MAX_RETRIES,
+    delay: float = FILE_SETTLE_DELAY,
+) -> bool:
+    """Wait for a file to stabilize (stop changing size and mtime)."""
+    p = Path(path)
+    if not p.exists():
+        return False
 
-    try:
-        # Match base names programmatically to prevent character bracket injection bugs
-        for p in media_p.parent.iterdir():
-            if p.is_file() and p.name.startswith(f"{base}.") and p.name.endswith(".srt"):
-                ext = p.name[len(base) + 1:-4]
-                if ext != tgt_ext and ext != "subs-pipeline" and validate_tgt_ext(ext)[0]:
-                    return p, ext
-    except OSError:
-        pass
-
-    legacy = media_p.parent / f"{base}.subs-pipeline.srt"
-    if legacy.exists():
-        return legacy, "und"
-
-    return media_p.parent / f"{base}.und.srt", "und"
+    last_size = -1
+    last_mtime = -1.0
+    for _ in range(max_retries):
+        try:
+            stat = p.stat()
+            current_size = stat.st_size
+            current_mtime = stat.st_mtime
+            
+            if current_size == last_size and current_mtime == last_mtime and current_size > 0:
+                # Perform access test on Windows to respect file sharing violations
+                if platform.system() == "Windows":
+                    try:
+                        with open(p, "rb+") as f:
+                            pass
+                    except IOError:
+                        time.sleep(delay)
+                        continue
+                return True
+            
+            last_size = current_size
+            last_mtime = current_mtime
+        except (IOError, OSError):
+            pass
+        time.sleep(delay)
+    return False
 
 
 # ════════════════════════════════════════════════════════════
@@ -2971,10 +3239,10 @@ def find_source_srt(media_p: Path, tgt_ext: str, src_lang: Optional[str] = None)
 # ════════════════════════════════════════════════════════════
 def process_file(
     media_path: Union[str, Path],
-    args: argparse.Namespace,
+    args: PipelineConfig,
     file_index: int = 1,
     total_files: int = 1,
-) -> Tuple[Dict[str, Any], float]:
+) -> Tuple[FileStatus, float]:
     """Process a single media file through the full pipeline with container validations."""
     media_p = Path(media_path)
     base = media_p.stem
@@ -2983,39 +3251,27 @@ def process_file(
     unique_id = uuid.uuid4().hex[:16]
     temp_audio = media_p.parent / f"temp_{base}_{unique_id}_audio.wav"
 
-    status: Dict[str, Any] = {
-        "transcribed": False,
-        "translated": False,
-        "reused_srt": False,
-        "reused_all": False,
-        "mixed_language": False,
-        "partial_success": False,
-        "fallback_count": 0,
-        "muxed": False,
-        "skipped": False,
-        "error": False,
-        "audio_failed": False,
-    }
+    status = FileStatus()
 
     qprint(f"\n{C.BOLD}── [{file_index}/{total_files}] {base}{C.RESET}")
     logger.debug("Processing file: %s", media_p)
 
     if not media_p.exists():
-        qprint(f"  {C.RED}[x] File no longer exists -- skipping.{C.RESET}")
-        status["error"] = True
+        qprint(f"  {style('[x]', C.RED)} File no longer exists -- skipping.")
+        status.error = True
         return status, 0.0
 
     if not is_safe_relative(media_p, args.folder):
         qprint(
-            f"  {C.RED}[x] Path traversal detected via symlink -- "
-            f"file resolves outside target directory.{C.RESET}"
+            f"  {style('[x]', C.RED)} Path traversal detected via symlink -- "
+            f"file resolves outside target directory."
         )
-        status["error"] = True
+        status.error = True
         return status, 0.0
 
     if str(media_path).startswith("-") or media_p.name.startswith("-"):
-        qprint(f"  {C.RED}[x] Error: Media path starts with an options flag parameter.{C.RESET}")
-        status["error"] = True
+        qprint(f"  {style('[x]', C.RED)} Error: Media path starts with an options flag parameter.")
+        status.error = True
         return status, 0.0
 
     srt_src, src_lang_code = find_source_srt(media_p, args.tgt_ext, args.src_lang)
@@ -3030,7 +3286,7 @@ def process_file(
             try:
                 legacy_old_srt.rename(standard_src_path)
                 srt_src = standard_src_path
-                qprint(f"  {C.DIM}[~] Converted legacy format: '{legacy_old_srt.name}' -> '{standard_src_path.name}'.{C.RESET}")
+                qprint(f"  {style('[~]', C.DIM)} Converted legacy format: '{legacy_old_srt.name}' -> '{standard_src_path.name}'.")
             except OSError as e:
                 logger.debug("Migration of %s failed: %s", legacy_old_srt, e)
 
@@ -3039,7 +3295,7 @@ def process_file(
             try:
                 legacy_subs_pipeline.rename(standard_src_path)
                 srt_src = standard_src_path
-                qprint(f"  {C.DIM}[~] Migrated generic source subtitle: '{legacy_subs_pipeline.name}' -> '{standard_src_path.name}'.{C.RESET}")
+                qprint(f"  {style('[~]', C.DIM)} Migrated generic source subtitle: '{legacy_subs_pipeline.name}' -> '{standard_src_path.name}'.")
             except OSError as e:
                 logger.debug("Migration of %s failed: %s", legacy_subs_pipeline, e)
 
@@ -3054,7 +3310,7 @@ def process_file(
         if ok:
             tgt_exists_and_healthy = True
         else:
-            qprint(f"  {C.YELLOW}[!] Existing target SRT '{srt_tgt.name}' is invalid ({reason}). Re-generating.{C.RESET}")
+            qprint(f"  {style('[!]', C.YELLOW)} Existing target SRT '{srt_tgt.name}' is invalid ({reason}). Re-generating.")
             safe_remove(srt_tgt)
 
     existing_out_path = None
@@ -3066,7 +3322,7 @@ def process_file(
             if ok:
                 existing_out_path = candidate
             else:
-                qprint(f"  {C.YELLOW}[!] Existing container output failed integrity checks. Cleaning up.{C.RESET}")
+                qprint(f"  {style('[!]', C.YELLOW)} Existing container output failed integrity checks. Cleaning up.")
                 safe_remove(candidate)
     else:
         for parent_dir in media_p.parent.glob("muxed_*"):
@@ -3078,7 +3334,7 @@ def process_file(
                         existing_out_path = candidate
                         break
                     else:
-                        qprint(f"  {C.YELLOW}[!] Existing container output failed integrity checks. Cleaning up.{C.RESET}")
+                        qprint(f"  {style('[!]', C.YELLOW)} Existing container output failed integrity checks. Cleaning up.")
                         safe_remove(candidate)
 
     if existing_out_path:
@@ -3088,8 +3344,8 @@ def process_file(
 
     if not check_disk_space(media_p.parent):
         qprint(
-            f"  {C.YELLOW}[!] Insufficient disk space. "
-            f"Attempting to continue...{C.RESET}"
+            f"  {style('[!]', C.YELLOW)} Insufficient disk space. "
+            f"Attempting to continue..."
         )
 
     src_exists_and_healthy = False
@@ -3103,7 +3359,7 @@ def process_file(
 
     # ── DRY RUN SIMULATION PATHWAY ───────────────────────
     if args.dry_run:
-        qprint(f"  {C.YELLOW}[DRY-RUN] Planning execution for file: {base}{C.RESET}")
+        qprint(f"  {style('[DRY-RUN]', C.YELLOW)} Planning execution for file: {base}")
 
         if srt_src.exists():
             qprint(f"    - Existing source subtitle '{srt_src.name}' detected.")
@@ -3112,81 +3368,80 @@ def process_file(
                     f"      [Health Check] PASS: Reusing '{srt_src.name}' "
                     f"(transcription bypassed)."
                 )
-                status["reused_srt"] = True
+                status.reused_srt = True
             else:
                 qprint(
-                    f"      {C.YELLOW}[Health Check] FAIL: '{srt_src.name}' "
-                    f"is invalid.{C.RESET}"
+                    f"      {style('[Health Check]', C.YELLOW)} FAIL: '{srt_src.name}' "
+                    f"is invalid."
                 )
                 qprint(
                     f"      -> Simulated Action: Re-extract audio & transcribe "
                     f"(using model {args.model.upper()})."
                 )
-                status["transcribed"] = True
+                status.transcribed = True
         else:
             qprint(f"    - No source subtitle exists.")
             qprint(
                 f"    - Simulated Action: Extract audio and transcribe using "
                 f"local {args.model.upper()} engine."
             )
-            status["transcribed"] = True
+            status.transcribed = True
 
         if srt_tgt.exists():
             qprint(f"    - Existing target subtitle '{srt_tgt.name}' detected.")
             fallback_match_threshold = getattr(args, "fallback_match_threshold", 0.95)
             if srt_src.exists():
-                fallbacks, _ = detect_fallbacks(srt_src, srt_tgt, fallback_match_threshold)
+                fallbacks, _ = detect_fallbacks(srt_src, srt_tgt, fallback_match_threshold, src_lang_code)
             else:
                 fallbacks = 0
             if fallbacks > 0:
                 qprint(f"      [Status Check] Target file contains {fallbacks} fallback block(s).")
-                status["mixed_language"] = True
-                status["fallback_count"] = fallbacks
+                status.mixed_language = True
+                status.fallback_count = fallbacks
             else:
                 qprint(f"      [Status Check] Target file looks fully translated.")
-                status["translated"] = True
+                status.translated = True
         elif args.translate:
             qprint(
                 f"    - Simulated Action: Translate dialogue to {args.tgt_lang} "
                 f"using {args.translator.upper()} API."
             )
-            status["translated"] = True
+            status.translated = True
 
         if args.embed:
             if out_path.exists():
                 qprint(f"    - Output video already exists at '{out_path.name}'.")
-                status["reused_all"] = True
+                status.reused_all = True
             else:
                 qprint(
                     f"    - Simulated Action: Mux subtitles into final '{out_ext}' "
                     f"container ({'Hardsub' if args.hardsub else 'Softsub'})."
                 )
-                status["muxed"] = True
+                status.muxed = True
         return status, 0.02
 
     if out_path.exists() and out_path.stat().st_size >= MUXED_MIN_BYTES:
         qprint(
-            f"  {C.GREEN}[+] Output file already exists. "
-            f"Skipping processing.{C.RESET}"
+            f"  {style('[+]', C.GREEN)} Output file already exists. "
+            f"Skipping processing."
         )
-        status["reused_all"] = True
+        status.reused_all = True
         return status, 0.0
 
     if duration <= 0:
         qprint(
-            f"  {C.YELLOW}[!] Could not determine duration -- "
-            f"progress % unavailable.{C.RESET}"
+            f"  {style('[!]', C.YELLOW)} Could not determine duration -- "
+            f"progress % unavailable."
         )
 
     try:
         # ── STEP 1: AUDIO EXTRACTION ──────────────────────
         audio_extracted_successfully = False
         if need_transcribe:
-            # Active checking and pre-downloading model if needed
-            qprint(f"  {C.DIM}[~] Checking Whisper model cache for '{args.model}'...{C.RESET}")
+            qprint(f"  {style('[~]', C.DIM)} Ensuring Whisper model '{args.model}' is downloaded...")
             download_whisper_model_if_needed(args.model)
             
-            qprint(f"  {C.CYAN}> Extracting audio...{C.RESET}")
+            qprint(f"  {style('>', C.CYAN)} Extracting audio...")
             try:
                 # Scoped file guard guarantees cleanup of intermediate audio
                 with temp_file_guard(temp_audio) as guarded_audio:
@@ -3195,10 +3450,10 @@ def process_file(
                         # ── STEP 2: TRANSCRIPTION ─────────────────────────
                         transcription_success, detected_lang = _transcribe_audio(guarded_audio, srt_src, duration, args)
                         if not transcription_success:
-                            status["error"] = True
+                            status.error = True
                             return status, time.time() - t_start
                         
-                        status["transcribed"] = True
+                        status.transcribed = True
 
                         if src_lang_code == "und" and detected_lang != "unknown":
                             final_src_path = media_p.parent / f"{base}.{detected_lang}.srt"
@@ -3207,17 +3462,17 @@ def process_file(
                                     os.replace(str(srt_src), str(final_src_path))
                                     srt_src = final_src_path
                                     src_lang_code = detected_lang
-                                    qprint(f"  {C.DIM}[~] Standardized source subtitle to language code: '{srt_src.name}'{C.RESET}")
+                                    qprint(f"  {style('[~]', C.DIM)} Standardized source subtitle to language code: '{srt_src.name}'")
                                 except Exception as e:
                                     logger.debug("Failed to standardize dynamic source SRT name: %s", e)
                     else:
-                        status["audio_failed"] = True
-                        status["error"] = True
+                        status.audio_failed = True
+                        status.error = True
                         return status, time.time() - t_start
             except ValueError as val_err:
-                qprint(f"  {C.RED}[x] Extraction blocked: {val_err}{C.RESET}")
-                status["audio_failed"] = True
-                status["error"] = True
+                qprint(f"  {style('[x]', C.RED)} Extraction blocked: {val_err}")
+                status.audio_failed = True
+                status.error = True
                 return status, time.time() - t_start
 
         # ── SRT HEALTH CHECK ──────────────────────────────
@@ -3226,15 +3481,15 @@ def process_file(
             ok, reason = is_valid_srt(srt_src, duration, args.min_blocks, args)
             if not ok:
                 qprint(
-                    f"  {C.YELLOW}[!] SRT health check failed: {reason}{C.RESET}"
+                    f"  {style('[!]', C.YELLOW)} SRT health check failed: {reason}"
                 )
-                qprint(f"  {C.YELLOW}    Translation skipped.{C.RESET}")
+                qprint(f"  {style('[!]', C.YELLOW)}     Translation skipped.")
                 srt_src_healthy = False
-                status["skipped"] = True
+                status.skipped = True
 
         if not srt_src_healthy and not tgt_exists_and_healthy:
-            qprint(f"  {C.RED}[x] Error: No healthy subtitle file available, and transcription is disabled/unavailable.{C.RESET}")
-            status["error"] = True
+            qprint(f"  {style('[x]', C.RED)} Error: No healthy subtitle file available, and transcription is disabled/unavailable.")
+            status.error = True
             return status, time.time() - t_start
 
         # ── STEP 3: TRANSLATION ───────────────────────────
@@ -3252,11 +3507,11 @@ def process_file(
             ):
                 Context.set_translation_disabled(True)
                 qprint(
-                    f"  {C.RED}[!] Translation suspended due to persistent "
-                    f"communication failures.{C.RESET}"
+                    f"  {style('[!]', C.RED)} Translation suspended due to persistent "
+                    f"communication failures."
                 )
             else:
-                qprint(f"  {C.CYAN}> Translating -> {args.tgt_lang}...{C.RESET}")
+                qprint(f"  {style('>', C.CYAN)} Translating -> {args.tgt_lang}...")
                 
                 translator = getattr(args, "translator", "gemini")
                 trans_model = getattr(args, "translation_model", None)
@@ -3273,22 +3528,23 @@ def process_file(
                     api_url=api_url_val,
                     fallback_match_threshold=fallback_match_threshold,
                     tgt_ext=args.tgt_ext,
+                    src_lang=src_lang_code,
                 )
                 if success:
                     if fallbacks > 0:
-                        status["mixed_language"] = True
-                        status["partial_success"] = True
-                        status["fallback_count"] = fallbacks
+                        status.mixed_language = True
+                        status.partial_success = True
+                        status.fallback_count = fallbacks
                         qprint(
-                            f"  {C.YELLOW}[~] Partial Success: {fallbacks} "
-                            f"block(s) fell back to source language.{C.RESET}"
+                            f"  {style('[~]', C.YELLOW)} Partial Success: {fallbacks} "
+                            f"block(s) fell back to source language."
                         )
                     else:
-                        status["translated"] = True
-                        qprint(f"  {C.GREEN}[+] Translation done.{C.RESET}")
+                        status.translated = True
+                        qprint(f"  {style('[+]', C.GREEN)} Translation done.")
                 else:
                     qprint(
-                        f"  {C.RED}[x] Translation skipped/failed: {msg}{C.RESET}"
+                        f"  {style('[x]', C.RED)} Translation skipped/failed: {msg}"
                     )
 
         # ── STEP 4: EMBED ─────────────────────────────────
@@ -3298,28 +3554,28 @@ def process_file(
 
         if srt_tgt.exists():
             target_srt = srt_tgt
-            if not status.get("translated") and not status.get("mixed_language"):
+            if not status.translated and not status.mixed_language:
                 if srt_src.exists():
-                    fallback_count, _ = detect_fallbacks(srt_src, srt_tgt, fallback_match_threshold)
+                    fallback_count, _ = detect_fallbacks(srt_src, srt_tgt, fallback_match_threshold, src_lang_code)
                     if fallback_count > 0:
-                        status["mixed_language"] = True
-                        status["partial_success"] = True
-                        status["fallback_count"] = fallback_count
+                        status.mixed_language = True
+                        status.partial_success = True
+                        status.fallback_count = fallback_count
                         qprint(
-                            f"  {C.YELLOW}[~] Target file contains {fallback_count} "
-                            f"unchanged fallback blocks.{C.RESET}"
+                            f"  {style('[~]', C.YELLOW)} Target file contains {fallback_count} "
+                            f"unchanged fallback blocks."
                         )
                     else:
-                        status["reused_srt"] = True
+                        status.reused_srt = True
                 else:
-                    status["reused_srt"] = True
+                    status.reused_srt = True
 
         elif srt_src.exists() and srt_src_healthy:
             target_srt = srt_src
             if args.translate:
                 qprint(
-                    f"  {C.YELLOW}[!] Using source SRT -- "
-                    f"translated SRT unavailable.{C.RESET}"
+                    f"  {style('[!]', C.YELLOW)} Using source SRT -- "
+                    f"translated SRT unavailable."
                 )
 
         actual_lang = args.tgt_ext if target_srt == srt_tgt else src_lang_code
@@ -3329,26 +3585,26 @@ def process_file(
             out_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             qprint(
-                f"  {C.RED}[x] Failed to create output directory: {e}{C.RESET}"
+                f"  {style('[x]', C.RED)} Failed to create output directory: {e}"
             )
-            status["error"] = True
+            status.error = True
             return status, time.time() - t_start
 
         if out_path.exists():
             if out_path.stat().st_size < MUXED_MIN_BYTES:
                 qprint(
-                    f"  {C.YELLOW}[!] Removing incomplete output from "
-                    f"previous run.{C.RESET}"
+                    f"  {style('[!]', C.YELLOW)} Removing incomplete output from "
+                    f"previous run."
                 )
                 safe_remove(out_path)
 
         if args.embed and target_srt and not out_path.exists():
             if is_audio:
                 qprint(
-                    f"  {C.DIM}[~] Audio-only file -- muxing skipped.{C.RESET}"
+                    f"  {style('[~]', C.DIM)} Audio-only file -- muxing skipped."
                 )
             else:
-                qprint(f"  {C.CYAN}> Muxing...{C.RESET}")
+                qprint(f"  {style('>', C.CYAN)} Muxing...")
 
                 try:
                     if args.hardsub:
@@ -3386,44 +3642,54 @@ def process_file(
                             capture_output=True,
                             encoding="utf-8",
                             errors="replace",
+                            timeout=FFMPEG_STREAM_TIMEOUT
                         )
 
                     if result.returncode != 0:
                         err = (
-                            result.stderr.strip()[:500]
+                            result.stderr.strip()[:STDERR_TRUNCATION_LIMIT]
                             if result.stderr
                             else ""
                         )
                         if err:
                             qprint(f"  {C.DIM}    FFmpeg: {err}{C.RESET}")
+                        raise MuxError(f"Muxing failed with exit code {result.returncode}. Error: {err}")
 
                     ok, reason = verify_mux_output(out_path, hardsub=args.hardsub)
                     if ok:
                         qprint(
-                            f"  {C.GREEN}[+] -> "
-                            f"{out_path.parent.name}\\{out_path.name}{C.RESET}"
+                            f"  {style('[+]', C.GREEN)} -> "
+                            f"{out_path.parent.name}\\{out_path.name}"
                         )
-                        status["muxed"] = True
+                        status.muxed = True
                     else:
-                        qprint(
-                            f"  {C.YELLOW}[!] Mux validation failed: "
-                            f"{reason}{C.RESET}"
-                        )
+                        raise MuxError(f"Mux validation failed: {reason}")
 
+                except MuxError:
+                    raise
                 except Exception as e:
-                    qprint(f"  {C.RED}[x] Muxing error: {e}{C.RESET}")
+                    raise MuxError(f"Muxing process error: {e}")
 
+    except TranscriptionError as te:
+        qprint(f"  {style('[x]', C.RED)} Transcription error: {te}")
+        status.error = True
+    except MuxError as me:
+        qprint(f"  {style('[x]', C.RED)} Muxing error: {me}")
+        status.error = True
+    except TranslationError as tre:
+        qprint(f"  {style('[x]', C.RED)} Translation error: {tre}")
+        status.error = True
     except KeyboardInterrupt:
         qprint(
-            f"\n{C.YELLOW}[!] Interrupted during processing of {base}.{C.RESET}"
+            f"\n{style('[!]', C.YELLOW)} Interrupted during processing of {base}."
         )
         cleanup_all_temp_files()
         raise
     except Exception as e:
         qprint(
-            f"  {C.RED}[x] Unexpected pipeline processing error: {e}{C.RESET}"
+            f"  {style('[x]', C.RED)} Unexpected pipeline processing error: {e}"
         )
-        status["error"] = True
+        status.error = True
 
     finally:
         perform_vram_gc()
@@ -3436,7 +3702,7 @@ def process_file(
 # ════════════════════════════════════════════════════════════
 def enumerate_media_files(folder: Union[str, Path], recursive: bool = False) -> List[Path]:
     """Enumerate media files in the target folder, preventing internal output indexing."""
-    folder_path = Path(folder)
+    folder_path = Path(folder).resolve()
     media_files: List[Path] = []
 
     if recursive:
@@ -3454,7 +3720,7 @@ def enumerate_media_files(folder: Union[str, Path], recursive: bool = False) -> 
                 
                 # Exclude any files residing inside generated output directories
                 skip_file = False
-                for part in real_p.relative_to(folder_path.resolve()).parts[:-1]:
+                for part in real_p.relative_to(folder_path).parts[:-1]:
                     if part.startswith("muxed_"):
                         skip_file = True
                         break
@@ -3634,17 +3900,17 @@ def main() -> None:
         dest="fallback_match_threshold",
         help="Fallback fuzzy match threshold (0.0-1.0)",
     )
-    args = parser.parse_args()
+    args_parsed = parser.parse_args()
 
-    if args.test:
+    if args_parsed.test:
         success = run_self_tests()
         sys.exit(0 if success else 1)
 
     enable_windows_ansi()
 
     global logger
-    logger = setup_logging(quiet=args.quiet, verbose=args.verbose)
-    Context.quiet = args.quiet
+    logger = setup_logging(quiet=args_parsed.quiet, verbose=args_parsed.verbose)
+    Context.quiet = args_parsed.quiet
 
     Context.clear_mutable_states()
     Context.reset_all_counters()
@@ -3652,9 +3918,20 @@ def main() -> None:
     global global_cfg
     global_cfg = load_config()
 
-    for key, default_val in DEFAULT_CONFIG.items():
-        if not hasattr(args, key) or getattr(args, key) is None:
-            setattr(args, key, global_cfg.get(key, default_val))
+    config_fields = PipelineConfig.__dataclass_fields__.keys()
+    merged_dict = {}
+    for key in config_fields:
+        if hasattr(args_parsed, key) and getattr(args_parsed, key) is not None:
+            merged_dict[key] = getattr(args_parsed, key)
+            Context.provenance[key] = "CLI"
+        elif key in global_cfg:
+            merged_dict[key] = global_cfg[key]
+            Context.provenance[key] = "Config File"
+        else:
+            merged_dict[key] = DEFAULT_CONFIG.get(key, PipelineConfig.__dataclass_fields__[key].default)
+            Context.provenance[key] = "Default"
+
+    args = PipelineConfig(**merged_dict)
 
     if args.gemini_model and getattr(args, "translation_model", None) == DEFAULT_CONFIG["translation_model"]:
         args.translation_model = args.gemini_model
@@ -3667,16 +3944,15 @@ def main() -> None:
             if is_valid:
                 args.api_key = env_key
             else:
-                qprint(f"  {C.YELLOW}[!] Ignored invalid API_KEY environment variable.{C.RESET}")
+                qprint(f"  {style('[!]', C.YELLOW)} Ignored invalid API_KEY environment variable.")
                 args.api_key = ""
 
-    args.no_cleanup = args.no_cleanup if args.no_cleanup is not None else global_cfg.get("skip_cleanup", False)
+    args.no_cleanup = args.no_cleanup if args.no_cleanup is not None else global_cfg.get("no_cleanup", False)
     args.skip_migration = args.skip_migration if args.skip_migration is not None else global_cfg.get("skip_migration", False)
     args.explain_summary = args.explain_summary if args.explain_summary is not None else global_cfg.get("explain_summary", True)
 
     if args.model:
         args.model = args.model.lower().strip()
-        # Ensure numerical CLI shortcuts are mapped properly during initial parser steps
         if args.model in MODEL_MAP:
             args.model = MODEL_MAP[args.model]
             
@@ -3698,30 +3974,9 @@ def main() -> None:
     if args.src_lang and not args.src_lang.strip():
         args.src_lang = None
 
-    args.transcribe = not args.skip_transcribe
-    args.translate = not args.skip_translate and (bool(args.api_key) or args.translator == "google")
-    args.embed = not args.skip_embed
+    resolve_pipeline_steps(args)
 
     check_dependencies(headless=args.headless)
-
-    cli_supplied_keys = set()
-    for action in parser._actions:
-        if action.dest and action.option_strings:
-            if any(opt in sys.argv for opt in action.option_strings):
-                cli_supplied_keys.add(action.dest)
-
-    for key in DEFAULT_CONFIG.keys():
-        dest_map = {
-            "skip_cleanup": "no_cleanup",
-            "skip_migration": "skip_migration",
-        }
-        dest_name = dest_map.get(key, key)
-        if dest_name in cli_supplied_keys:
-            Context.provenance[key] = "CLI"
-        elif key in global_cfg:
-            Context.provenance[key] = "Config File"
-        else:
-            Context.provenance[key] = "Default"
 
     if not args.headless:
         interactive_wizard(args, global_cfg)
@@ -3755,7 +4010,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    summary: List[Tuple[str, Dict[str, Any], float]] = []
+    summary: List[Tuple[str, FileStatus, float]] = []
     batch_start = time.time()
 
     if media_files:
@@ -3765,17 +4020,17 @@ def main() -> None:
                 summary.append((Path(file).name, status, elapsed))
             except KeyboardInterrupt:
                 qprint(
-                    f"\n{C.YELLOW}[!] Interrupted during batch loop "
-                    f"processing.{C.RESET}"
+                    f"\n{style('[!]', C.YELLOW)} Interrupted during batch loop "
+                    f"processing."
                 )
-                summary.append((Path(file).name, {"error": True}, 0.0))
+                summary.append((Path(file).name, FileStatus(error=True), 0.0))
                 break
             except Exception as e:
                 qprint(
                     f"{C.RED}  [x] Processing fault encountered on "
                     f"{Path(file).name}: {e}{C.RESET}"
                 )
-                summary.append((Path(file).name, {"error": True}, 0.0))
+                summary.append((Path(file).name, FileStatus(error=True), 0.0))
 
         total_time = time.time() - batch_start
         if not args.quiet:
@@ -3784,8 +4039,8 @@ def main() -> None:
             write_audit_log(args, summary, total_time)
     else:
         qprint(
-            f"{C.YELLOW}\n  No compatible media files found inside target "
-            f"location.{C.RESET}"
+            f"{style('[!]', C.YELLOW)}\n  No compatible media files found inside target "
+            f"location."
         )
 
     if args.watch:
@@ -3795,12 +4050,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Crucial Windows PyInstaller / spawn multiprocessing intercept
     multiprocessing.freeze_support()
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{C.YELLOW}[!] Force terminating...{C.RESET}")
+        print(f"\n{style('[!]', C.YELLOW)} Force terminating...")
         exit_app(0)
     except Exception as e:
         print(f"\n{C.RED}[x] FATAL RUN ERROR: {e}{C.RESET}")
