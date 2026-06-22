@@ -2,7 +2,7 @@
 Subs Pipeline: An Automated Video Transcription and Translation Pipeline.
 
 This pipeline automates transcription using local Faster Whisper engines and translates
-subtitles through leading API endpoints (Gemini, OpenAI, Anthropic, DeepL, Google).
+subtitles through leading API endpoints (Gemini, OpenAI, Anthropic, DeepL, Google, Ollama).
 It handles batch processing, filesystem watching, error recovery, and robust video muxing.
 """
 
@@ -55,6 +55,9 @@ __all__ = [
     "translate_srt_native",
     "find_source_srt",
     "process_file",
+    "verify_translation_quality",
+    "get_local_ollama_models",
+    "pull_ollama_model",
     "main",
 ]
 
@@ -131,7 +134,7 @@ def enable_windows_ansi() -> None:
 # ════════════════════════════════════════════════════════════
 #  MODULE METADATA
 # ════════════════════════════════════════════════════════════
-__version__ = "1.4"
+__version__ = "1.5"
 __author__ = "Subs Pipeline Team"
 
 # ════════════════════════════════════════════════════════════
@@ -195,6 +198,7 @@ FALLBACK_MODELS: Final[Dict[str, str]] = {
     "gemini": "gemini-3.5-flash",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
+    "ollama": "qwen2.5:7b",
 }
 
 # Timings & Chunking Constants
@@ -679,11 +683,18 @@ def _transcribe_worker_loop(
             task = req_queue.get()
             if task is None:
                 break
-            audio_path, lang_hint, beam_size = task
+                
+            task_type = "transcribe"
+            if len(task) == 4:
+                audio_path, lang_hint, beam_size, task_type = task
+            else:
+                audio_path, lang_hint, beam_size = task
+                
             segments, info = model.transcribe(
                 audio_path,
                 beam_size=beam_size,
                 language=lang_hint,
+                task=task_type,
             )
             res_queue.put(("info", (info.language, info.language_probability)))
             
@@ -748,6 +759,7 @@ class TranscriptionManager:
         lang_hint: Optional[str],
         beam_size: int,
         timeout: float,
+        task_type: str = "transcribe",
     ) -> Generator[Tuple[str, Any], None, None]:
         """Transcribe audio using the persistent process, serialization locks handle concurrency."""
         with cls._transcribe_mutex:
@@ -790,7 +802,7 @@ class TranscriptionManager:
                         raise TranscriptionError(f"Unexpected response from transcription worker initialization: {msg_type}")
 
                 cls._drain_queue(cls._res_queue)
-                cls._req_queue.put((audio_path, lang_hint, beam_size))
+                cls._req_queue.put((audio_path, lang_hint, beam_size, task_type))
 
             deadline = time.monotonic() + timeout
             try:
@@ -1427,7 +1439,7 @@ def _prepare_translation_prompt(chunk: List[str], tgt_lang: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════
-#  SRT HEALTH CHECK
+#  SRT HEALTH CHECK & QUALITY ASSURANCE
 # ════════════════════════════════════════════════════════════
 def is_valid_srt(
     srt_path: Union[str, Path],
@@ -1533,6 +1545,108 @@ def is_valid_srt(
     return True, "OK"
 
 
+def verify_translation_quality(
+    src_path: Union[str, Path],
+    tgt_path: Union[str, Path],
+    tgt_ext: str,
+) -> Tuple[bool, str]:
+    """
+    Validate translation quality by comparing target blocks against source blocks.
+    Flags files where average text length deviates excessively or contains garbled blocks.
+    """
+    src_map = parse_srt_to_dict(src_path)
+    tgt_map = parse_srt_to_dict(tgt_path)
+    if not src_map or not tgt_map:
+        return False, "Empty or unparseable translation mapping."
+    
+    length_deviations = 0
+    empty_blocks = 0
+    total_blocks = len(tgt_map)
+    
+    for b_id, src_txt in src_map.items():
+        if b_id not in tgt_map:
+            continue
+        tgt_txt = tgt_map[b_id]
+        
+        if not tgt_txt.strip():
+            empty_blocks += 1
+            continue
+        
+        s_len = len(src_txt)
+        t_len = len(tgt_txt)
+        
+        # Check for extreme length deviation (e.g., target is > 4x longer or < 1/4 of source)
+        # indicating hallucinated expansion or truncated/dropped output.
+        if s_len > 10:  # Only flag significant length blocks
+            if t_len > s_len * 4.0 or t_len < s_len * 0.25:
+                length_deviations += 1
+    
+    # If more than 35% of blocks deviate excessively or are empty, trigger warnings
+    if total_blocks > 0:
+        deviation_ratio = length_deviations / total_blocks
+        empty_ratio = empty_blocks / total_blocks
+        if deviation_ratio > 0.35:
+            return False, f"{deviation_ratio:.0%} of blocks have excessive translation length deviation (possible hallucination)."
+        if empty_ratio > 0.2:
+            return False, f"{empty_ratio:.0%} of blocks were left blank or dropped."
+            
+    return True, "OK"
+
+
+# ════════════════════════════════════════════════════════════
+#  OLLAMA HELPER PROCEDURES
+# ════════════════════════════════════════════════════════════
+def get_local_ollama_models(api_url: str) -> List[str]:
+    """Query local Ollama instance for pulled models to verify availability and prevent 404s."""
+    try:
+        raw_url = api_url.strip() if api_url else "http://localhost:11434"
+        if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+            raw_url = f"http://{raw_url}"
+        parsed = urllib.parse.urlparse(raw_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        tags_url = f"{base_url}/api/tags"
+        
+        req = urllib.request.Request(tags_url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            models = [m["name"] for m in data.get("models", [])]
+            return models
+    except Exception as e:
+        logger.debug("Failed to fetch local Ollama models list: %s", e)
+        return []
+
+
+def pull_ollama_model(api_url: str, model: str) -> bool:
+    """Programmatically pull an Ollama model if it's missing from the device."""
+    try:
+        raw_url = api_url.strip() if api_url else "http://localhost:11434"
+        if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+            raw_url = f"http://{raw_url}"
+        parsed = urllib.parse.urlparse(raw_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        pull_url = f"{base_url}/api/pull"
+        
+        qprint(f"  {style('[~]', C.CYAN)} Model '{model}' not found on device. Pulling from Ollama registry...")
+        
+        # Pull the model payload stream (use stream=False for atomic, high-timeout fetch)
+        payload = json.dumps({"name": model, "stream": False}).encode("utf-8")
+        req = urllib.request.Request(
+            pull_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req, timeout=3600) as response:
+            if response.status == 200:
+                qprint(f"  {style('[+]', C.GREEN)} Successfully pulled local Ollama model '{model}'!")
+                return True
+    except Exception as e:
+        logger.debug("Failed to pull local Ollama model %s: %s", model, e)
+        qprint(f"  {style('[x]', C.RED)} Failed to programmatically download local model '{model}': {e}")
+    return False
+
+
 # ════════════════════════════════════════════════════════════
 #  BOX RENDERING AND FORMATTING TOOLS
 # ════════════════════════════════════════════════════════════
@@ -1609,14 +1723,15 @@ def resolve_pipeline_steps(args: PipelineConfig, respect_interactive: bool = Fal
 
     has_api_key = bool(getattr(args, "api_key", ""))
     is_google = (getattr(args, "translator", "gemini") == "google")
+    is_ollama = (getattr(args, "translator", "gemini") == "ollama")
     
     if not respect_interactive:
-        args.translate = (has_api_key or is_google) and not getattr(args, "skip_translate", False)
+        args.translate = (has_api_key or is_google or is_ollama) and not getattr(args, "skip_translate", False)
     else:
         if getattr(args, "skip_translate", False):
             args.translate = False
         else:
-            args.translate = args.translate and (has_api_key or is_google)
+            args.translate = args.translate and (has_api_key or is_google or is_ollama)
 
     if not respect_interactive:
         args.embed = not getattr(args, "skip_embed", False)
@@ -1634,7 +1749,7 @@ def validate_args(args: PipelineConfig) -> None:
     
     if args.translator:
         args.translator = args.translator.lower().strip()
-        supported = {"gemini", "openai", "anthropic", "deepl", "google"}
+        supported = {"gemini", "openai", "anthropic", "deepl", "google", "ollama"}
         if args.translator not in supported:
             adjustments.append(f"Invalid translator '{args.translator}' detected. Resetting to default 'gemini'.")
             args.translator = "gemini"
@@ -1648,7 +1763,8 @@ def validate_args(args: PipelineConfig) -> None:
         "openai": "gpt-4o-mini",
         "anthropic": "claude-haiku-4-5",
         "deepl": "deepl-translator",
-        "google": "google-v1-free"
+        "google": "google-v1-free",
+        "ollama": "qwen2.5:7b",
     }
     
     if args.translate or args.translator:
@@ -1676,7 +1792,7 @@ def validate_args(args: PipelineConfig) -> None:
         args.embed = True
         Context.provenance["embed"] = "Auto-Override"
 
-    if args.translate and not args.api_key and args.translator != "google":
+    if args.translate and not args.api_key and args.translator not in ("google", "ollama"):
         adjustments.append(
             "Translation is requested, but no API key was configured. "
             "(Disabling translate step.)"
@@ -1698,7 +1814,7 @@ def validate_args(args: PipelineConfig) -> None:
 
     if adjustments:
         qprint(
-            f"\n{style('[!]', C.RED, C.BOLD)} Configuration Conflicts Resolved "
+            f"\n{style('[!]', C.YELLOW)} Configuration Conflicts Resolved "
             f"(Overriding Variables):"
         )
         for msg in adjustments:
@@ -2042,6 +2158,49 @@ def _build_google_payload(prompt_or_list: Union[str, List[str]], url_override: s
     return req_url, payload, headers
 
 
+def _build_ollama_payload(model: str, prompt_or_list: Union[str, List[str]], url_override: str, tgt_lang: str) -> Tuple[str, bytes, Dict[str, str]]:
+    # Normalize the host target url to ensure endpoints are combined cleanly
+    raw_url = url_override.strip() if url_override else "http://localhost:11434"
+    if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+        raw_url = f"http://{raw_url}"
+        
+    parsed = urllib.parse.urlparse(raw_url)
+    path = parsed.path if parsed.path else "/api/chat"
+    if path in ("", "/"):
+        path = "/api/chat"
+        
+    req_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+    headers = {"Content-Type": "application/json"}
+    
+    model_lower = model.lower()
+    # Structural adaptation depending on dedicated NMT vs general LLM instruction alignments
+    if "nllb" in model_lower or "opus" in model_lower or "helsinki" in model_lower:
+        system_instruction = (
+            f"Translate the following raw subtitle blocks directly into accurate and natural {tgt_lang}. "
+            "Only output the translated blocks following the template 'Block #[ID]: [translation]'."
+        )
+    else:
+        system_instruction = (
+            f"You are a professional film subtitle translator. "
+            f"Translate the provided blocks accurately into highly natural and context-aware {tgt_lang}. "
+            "Do not output conversational filler, introductions, explanations, or markdown wrappers. "
+            "Strictly follow this exact output template: 'Block #[ID]: [translated_text]'"
+        )
+
+    payload_dict = {
+        "model": model if model else "qwen2.5:7b",
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": prompt_or_list}
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.2
+        }
+    }
+    return req_url, json.dumps(payload_dict).encode("utf-8"), headers
+
+
 # ════════════════════════════════════════════════════════════
 #  TRANSLATION MOTOR MODULES
 # ════════════════════════════════════════════════════════════
@@ -2056,9 +2215,52 @@ def _execute_translator_request(
 ) -> Union[str, Dict[int, str]]:
     """Execute raw HTTP request targeting the selected translation provider with fallbacks."""
     translator = translator.lower().strip()
-    supported_translators = {"gemini", "openai", "anthropic", "deepl", "google"}
+    supported_translators = {"gemini", "openai", "anthropic", "deepl", "google", "ollama"}
     if translator not in supported_translators:
         raise ValueError(f"Unsupported translator provider choice: {translator}")
+
+    # Check model tags locally for Ollama tasks to verify pull statuses or auto-fallback
+    if translator == "ollama":
+        local_models = get_local_ollama_models(url_override)
+        target_clean = model.strip().lower()
+        matched_model = None
+        target_has_tag = ":" in target_clean
+
+        if local_models:
+            for lm in local_models:
+                lm_clean = lm.strip().lower()
+                if target_clean == lm_clean:
+                    matched_model = lm
+                    break
+                if not target_has_tag and lm_clean == f"{target_clean}:latest":
+                    matched_model = lm
+                    break
+        
+        if matched_model:
+            model = matched_model
+        else:
+            # Model not on device -> Programmatically pull
+            pull_success = pull_ollama_model(url_override, model)
+            if pull_success:
+                local_models = get_local_ollama_models(url_override)
+                for lm in local_models:
+                    lm_clean = lm.strip().lower()
+                    if target_clean == lm_clean or (not target_has_tag and lm_clean == f"{target_clean}:latest"):
+                        model = lm
+                        break
+            else:
+                if local_models:
+                    fallback_model = local_models[0]
+                    qprint(
+                        f"  {style('[!]', C.YELLOW)} Model pull failed or was bypassed. "
+                        f"Using existing model '{fallback_model}' to prevent execution crash."
+                    )
+                    model = fallback_model
+                else:
+                    raise TranslationError(
+                        f"Model '{model}' is not installed locally and pulling it failed. "
+                        "No local Ollama models are available to fall back to."
+                    )
 
     if not global_rate_limiter.acquire(timeout=30):
         raise RuntimeError("API request blocked: Rate limiter token acquisition timeout.")
@@ -2086,11 +2288,17 @@ def _execute_translator_request(
                 req_url, payload, headers = _build_deepl_payload(model, prompt_or_list, api_key, url_override, tgt_ext)
             elif translator == "google":
                 req_url, payload, headers = _build_google_payload(prompt_or_list, url_override, tgt_ext)
+            elif translator == "ollama":
+                req_url, payload, headers = _build_ollama_payload(model, prompt_or_list, url_override, tgt_lang)
 
             headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SubsPipeline/1.3"
 
             req = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT, context=ssl_context) as response:
+            
+            # Apply a generous timeout limit for Ollama execution requests to handle cold loading
+            req_timeout = 600 if translator == "ollama" else GEMINI_TIMEOUT
+            
+            with urllib.request.urlopen(req, timeout=req_timeout, context=ssl_context) as response:
                 resp_bytes = response.read()
                 if response.info().get("Content-Encoding") == "gzip":
                     resp_bytes = gzip.decompress(resp_bytes)
@@ -2140,6 +2348,16 @@ def _execute_translator_request(
                             for idx, item in enumerate(translations):
                                 translated_map[idx] = item.get("text", "")
                             success = True
+                    elif translator == "ollama":
+                        message = resp_data.get("message", {})
+                        response_text = message.get("content", "")
+                        if not response_text:
+                            # Fallback configuration check in the event an OpenAI proxy target configuration was mapped
+                            choices = resp_data.get("choices", [])
+                            if choices:
+                                response_text = choices[0].get("message", {}).get("content", "")
+                        if response_text.strip():
+                            success = True
 
                 if success:
                     Context.reset_consecutive_429s()
@@ -2147,6 +2365,13 @@ def _execute_translator_request(
                     break
 
         except urllib.error.HTTPError as e:
+            if e.code == 404 and translator == "ollama":
+                raise TranslationError(
+                    f"Ollama returned HTTP 404 (Not Found).\n"
+                    f"      This usually means model '{model}' is not installed.\n"
+                    f"      Please open a terminal and run: ollama pull {model}"
+                )
+
             if e.code == 400 and model != FALLBACK_MODELS.get(translator):
                 fallback = FALLBACK_MODELS.get(translator)
                 if fallback:
@@ -2177,6 +2402,12 @@ def _execute_translator_request(
                 Context.increment_consecutive_total_failures()
                 raise TranslationError(f"API Request failed with HTTP Error {e.code}")
         except urllib.error.URLError as e:
+            if translator == "ollama":
+                raise TranslationError(
+                    f"Failed to connect to local Ollama server at '{url_override or 'http://localhost:11434'}'.\n"
+                    f"      Ensure the Ollama application is running and accessible."
+                )
+                
             logger.warning("Connection failure encountered: %s. Retrying...", e.reason)
             if attempt == MAX_TRANSLATION_CHUNK_RETRIES - 1:
                 Context.increment_consecutive_total_failures()
@@ -2259,7 +2490,7 @@ def translate_srt_native(
 
     translator = translator.lower().strip()
     
-    if translator != "google":
+    if translator not in ("google", "ollama"):
         key_valid, key_err = validate_api_key(api_key)
         if not key_valid:
             return False, f"Invalid API key: {key_err}", 0
@@ -2269,6 +2500,7 @@ def translate_srt_native(
         "gpt-4o-mini" if translator == "openai" else
         "claude-haiku-4-5" if translator == "anthropic" else
         "google-v1-free" if translator == "google" else
+        "qwen2.5:7b" if translator == "ollama" else
         "deepl-translator"
     )
 
@@ -2610,7 +2842,7 @@ def interactive_wizard(
             args.api_url = cfg_memory.get("api_url", "")
             
             args.api_key = cfg_memory.get("api_key", "")
-            if not args.api_key and args.translator != "google":
+            if not args.api_key and args.translator not in ("google", "ollama"):
                 env_key = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "") or os.environ.get("DEEPL_API_KEY", "")
                 if env_key:
                     is_valid, _ = validate_api_key(env_key)
@@ -2619,7 +2851,7 @@ def interactive_wizard(
                     else:
                         qprint(f"  {style('[!]', C.YELLOW)} Ignored invalid credentials environment variable.")
                 
-            args.translate = (bool(args.api_key) or args.translator == "google") and not getattr(args, "skip_translate", False)
+            args.translate = (bool(args.api_key) or args.translator in ("google", "ollama")) and not getattr(args, "skip_translate", False)
             args.min_blocks = int(cfg_memory.get("min_blocks", 3))
 
             saved_model = cfg_memory.get("model")
@@ -2763,9 +2995,10 @@ def interactive_wizard(
     print(f"    {style('[2]', C.CYAN)} Anthropic        (Claude-4 models)")
     print(f"    {style('[3]', C.CYAN)} DeepL            (Dedicated plain text translation)")
     print(f"    {style('[4]', C.CYAN)} Google Translate (Free / Unofficial v1 API)")
+    print(f"    {style('[5]', C.CYAN)} Ollama           (Local self-hosted inference)")
     
     trans_in = input(f"  Selection [{saved_translator}]: ").strip().lower()
-    trans_map = {"0": "gemini", "1": "openai", "2": "anthropic", "3": "deepl", "4": "google"}
+    trans_map = {"0": "gemini", "1": "openai", "2": "anthropic", "3": "deepl", "4": "google", "5": "ollama"}
     args.translator = trans_map.get(trans_in, trans_in if trans_in in trans_map.values() else saved_translator)
     Context.provenance["translator"] = "Interactive"
 
@@ -2774,7 +3007,8 @@ def interactive_wizard(
         "openai": "gpt-4o-mini",
         "anthropic": "claude-haiku-4-5",
         "deepl": "deepl-translator",
-        "google": "google-v1-free"
+        "google": "google-v1-free",
+        "ollama": "qwen2.5:7b",
     }
 
     if args.translator == "google":
@@ -2782,6 +3016,40 @@ def interactive_wizard(
         args.api_url = ""
         args.api_key = ""
         qprint(f"  {style('[~]', C.GREEN)} Google Translate (Free) selected. API key and model selection bypassed.")
+    elif args.translator == "ollama":
+        print(f"\n{C.BOLD}── Local Translation Models sub-wizard ─────────────────────{C.RESET}")
+        print(f"    {style('[0]', C.CYAN)} Qwen2.5-7B (qwen2.5:7b)")
+        print(f"    {style('[1]', C.CYAN)} Llama-3-8B (llama3:8b)")
+        print(f"    {style('[2]', C.CYAN)} NLLB-200 (nllb)")
+        print(f"    {style('[3]', C.CYAN)} Opus-MT / Helsinki-NLP (opus-mt)")
+        print(f"    {style('[4]', C.CYAN)} Mistral-7B (mistral:7b)")
+        print(f"    {style('[5]', C.CYAN)} DeepSeek-R1-8B (deepseek-r1:8b)")
+        print(f"    {style('[6]', C.CYAN)} Gemma-2-9B (gemma2:9b)")
+        print(f"    {style('[7]', C.CYAN)} Phi-3.5 (phi3.5)")
+        print(f"    {style('[8]', C.CYAN)} Custom model tag")
+        
+        local_choice = input("  Selection [0]: ").strip()
+        local_map = {
+            "0": "qwen2.5:7b",
+            "1": "llama3:8b",
+            "2": "nllb",
+            "3": "opus-mt",
+            "4": "mistral:7b",
+            "5": "deepseek-r1:8b",
+            "6": "gemma2:9b",
+            "7": "phi3.5"
+        }
+        if local_choice in local_map:
+            args.translation_model = local_map[local_choice]
+        elif local_choice == "8":
+            args.translation_model = input("  Custom model tag: ").strip() or "qwen2.5:7b"
+        else:
+            args.translation_model = "qwen2.5:7b"
+            
+        saved_url = cfg_memory.get("api_url") or "http://localhost:11434/api/chat"
+        args.api_url = input(f"  Local Ollama Endpoint URL [{saved_url}]: ").strip() or saved_url
+        args.api_key = ""
+        qprint(f"  {style('[~]', C.GREEN)} Ollama translator configured with model: {args.translation_model}")
     else:
         saved_t_model = cfg_memory.get("translation_model") or model_defaults.get(args.translator, "gemini-3.5-flash")
         args.translation_model = input(f"  Translation Model [{saved_t_model}]: ").strip() or saved_t_model
@@ -2813,7 +3081,7 @@ def interactive_wizard(
                 break
             print(f"  {style('[!]', C.YELLOW)} {err} Please try again.")
             
-    args.translate = bool(args.api_key) or args.translator == "google"
+    args.translate = bool(args.api_key) or args.translator in ("google", "ollama")
     Context.provenance["api_key"] = "Interactive"
     Context.provenance["translate"] = "Interactive"
 
@@ -3125,7 +3393,8 @@ def _transcribe_audio(
     temp_audio: Path,
     srt_src: Path,
     duration: float,
-    args: PipelineConfig
+    args: PipelineConfig,
+    task_type: str = "transcribe",
 ) -> Tuple[bool, str]:
     """Run core transcribe functions against active audio samples."""
     transcription_success = False
@@ -3136,7 +3405,7 @@ def _transcribe_audio(
         tmp_srt = srt_src.with_suffix(".tmp")
         try:
             qprint(
-                f"  {style('>', C.CYAN)} Transcribing..."
+                f"  {style('>', C.CYAN)} Transcribing ({task_type})..."
                 f"{f' (attempt {attempt + 1}/{MAX_TRANSCRIPTION_RETRIES})' if attempt > 0 else ''}"
             )
             
@@ -3151,6 +3420,7 @@ def _transcribe_audio(
                 lang_hint=lang_hint,
                 beam_size=beam_size,
                 timeout=WHISPER_TRANSCRIBE_TIMEOUT,
+                task_type=task_type,
             )
 
             # Ensure cleanup of tmp_srt in the event of partial transcription errors
@@ -3363,6 +3633,11 @@ def process_file(
         if ok:
             src_exists_and_healthy = True
 
+    # Check if target language is English to bypass API translator and utilize Whisper's native English translate task
+    native_whisper_translate = False
+    if args.translate and args.tgt_ext.strip().lower() == "en" and not tgt_exists_and_healthy:
+        native_whisper_translate = True
+
     # Transcription is only skipped if we have a healthy source or target file
     need_transcribe = args.transcribe and not src_exists_and_healthy and not tgt_exists_and_healthy
 
@@ -3411,10 +3686,16 @@ def process_file(
                 qprint(f"      [Status Check] Target file looks fully translated.")
                 status.translated = True
         elif args.translate:
-            qprint(
-                f"    - Simulated Action: Translate dialogue to {args.tgt_lang} "
-                f"using {args.translator.upper()} API."
-            )
+            if native_whisper_translate:
+                qprint(
+                    f"    - Simulated Action: Translate dialogue to English "
+                    f"locally using Whisper native 'translate' pipeline task."
+                )
+            else:
+                qprint(
+                    f"    - Simulated Action: Translate dialogue to {args.tgt_lang} "
+                    f"using {args.translator.upper()} API."
+                )
             status.translated = True
 
         if args.embed:
@@ -3457,14 +3738,26 @@ def process_file(
                     audio_extracted_successfully = _extract_audio(media_p, guarded_audio)
                     if audio_extracted_successfully:
                         # ── STEP 2: TRANSCRIPTION ─────────────────────────
-                        transcription_success, detected_lang = _transcribe_audio(guarded_audio, srt_src, duration, args)
+                        target_output_srt = srt_tgt if native_whisper_translate else srt_src
+                        task_type = "translate" if native_whisper_translate else "transcribe"
+                        
+                        transcription_success, detected_lang = _transcribe_audio(
+                            guarded_audio, target_output_srt, duration, args, task_type=task_type
+                        )
                         if not transcription_success:
                             status.error = True
                             return status, time.time() - t_start
                         
                         status.transcribed = True
+                        if native_whisper_translate:
+                            status.translated = True
+                            # Preserve translated English output as source reference as well
+                            try:
+                                shutil.copy(srt_tgt, srt_src)
+                            except Exception:
+                                pass
 
-                        if src_lang_code == "und" and detected_lang != "unknown":
+                        if src_lang_code == "und" and detected_lang != "unknown" and not native_whisper_translate:
                             final_src_path = media_p.parent / f"{base}.{detected_lang}.srt"
                             if srt_src.exists() and srt_src != final_src_path:
                                 try:
@@ -3504,11 +3797,12 @@ def process_file(
         # ── STEP 3: TRANSLATION ───────────────────────────
         if (
             args.translate
+            and not native_whisper_translate
             and not Context.is_translation_disabled()
             and not srt_tgt.exists()
             and srt_src.exists()
             and srt_src_healthy
-            and (args.api_key or args.translator == "google")
+            and (args.api_key or args.translator in ("google", "ollama"))
         ):
             if (
                 Context.get_consecutive_total_failures()
@@ -3540,6 +3834,12 @@ def process_file(
                     src_lang=src_lang_code,
                 )
                 if success:
+                    # Enforce quality validation checks
+                    quality_ok, quality_msg = verify_translation_quality(srt_src, srt_tgt, args.tgt_ext)
+                    if not quality_ok:
+                        qprint(f"  {style('[!]', C.YELLOW)} Translation Quality warning: {quality_msg}")
+                        status.partial_success = True
+
                     if fallbacks > 0:
                         status.mixed_language = True
                         status.partial_success = True
@@ -3831,6 +4131,33 @@ def run_self_tests() -> bool:
     except TypeError as e:
         print(f"  {C.RED}[FAIL]{C.RESET} Natural keys mixed sorting logic (Error: {e})")
         failed += 1
+
+    # Test Quality Assurance Module with simulated excessive length deviation
+    with tempfile.NamedTemporaryFile("w", suffix=".srt", delete=False, encoding="utf-8") as s_tmp, \
+         tempfile.NamedTemporaryFile("w", suffix=".srt", delete=False, encoding="utf-8") as t_tmp:
+        s_tmp.write("1\n00:00:01,000 --> 00:00:03,000\nHello, how are you today?\n")
+        t_tmp.write("1\n00:00:01,000 --> 00:00:03,000\nThis is a massive hallucinated expansion of a very small source text which should fail the translation length check.\n")
+        s_path = s_tmp.name
+        t_path = t_tmp.name
+        
+    try:
+        ok, reason = verify_translation_quality(s_path, t_path, "en")
+        if not ok and "excessive translation length deviation" in reason:
+            print(f"  {C.GREEN}[PASS]{C.RESET} Translation quality check (hallucination detection)")
+        else:
+            print(f"  {C.RED}[FAIL]{C.RESET} Translation quality check (Got: {ok}, Reason: {reason})")
+            failed += 1
+    finally:
+        Path(s_path).unlink(missing_ok=True)
+        Path(t_path).unlink(missing_ok=True)
+
+    # Verify local Ollama model payload creation constructs formatted variables without issue
+    url, payload, headers = _build_ollama_payload("qwen2.5:7b", "Block #1:\nHello\n", "", "Spanish")
+    if b"qwen2.5:7b" in payload and b"Spanish" in payload:
+        print(f"  {C.GREEN}[PASS]{C.RESET} Ollama local model payload builder")
+    else:
+        print(f"  {C.RED}[FAIL]{C.RESET} Ollama local model payload builder")
+        failed += 1
         
     print(f"{C.CYAN}───────────────────────────────────────────────────────────{C.RESET}")
     if failed == 0:
@@ -3890,7 +4217,7 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", dest="verbose", help="Enable verbose/debug output")
     parser.add_argument("--gemini-model", type=str, default=None, dest="gemini_model", help="Gemini model name (Legacy option map)")
     
-    parser.add_argument("--translator", type=str, default=None, choices=["gemini", "openai", "anthropic", "deepl", "google"], dest="translator", help="Translator provider choice (gemini, openai, anthropic, deepl, google)")
+    parser.add_argument("--translator", type=str, default=None, choices=["gemini", "openai", "anthropic", "deepl", "google", "ollama"], dest="translator", help="Translator provider choice (gemini, openai, anthropic, deepl, google, ollama)")
     parser.add_argument("--translation-model", type=str, default=None, dest="translation_model", help="Specific translation model to invoke")
     parser.add_argument("--api-url", type=str, default=None, dest="api_url", help="Custom base API gateway endpoint override")
 
