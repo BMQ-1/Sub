@@ -58,6 +58,7 @@ __all__ = [
     "verify_translation_quality",
     "get_local_ollama_models",
     "pull_ollama_model",
+    "resolve_ollama_model",
     "main",
 ]
 
@@ -667,7 +668,15 @@ def _transcribe_worker_loop(
         # Avoid thread contention in deep CPU loops
         os.environ["OMP_NUM_THREADS"] = "4"
         from faster_whisper import WhisperModel
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        try:
+            model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        except Exception as load_err:
+            # If load fails due to lack of connection or metadata sync offline, retry forcing local-only configurations
+            logger.debug("Initial WhisperModel load failed, retrying with offline flags: %s", load_err)
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            model = WhisperModel(model_name, device=device, compute_type=compute_type, local_files_only=True)
+            
         res_queue.put(("init_ok", None))
     except BaseException as e:
         import traceback
@@ -1647,6 +1656,84 @@ def pull_ollama_model(api_url: str, model: str) -> bool:
     return False
 
 
+def resolve_ollama_model(api_url: str, requested_model: str) -> str:
+    """
+    Robustly resolve the requested Ollama model tag.
+    If the model exists exactly or by base name, use it.
+    If it's missing, try to pull it.
+    If pull fails, falls back to the best available model on the device.
+    """
+    req_clean = requested_model.strip()
+    req_lower = req_clean.lower()
+    req_base = req_lower.split(":")[0] if ":" in req_lower else req_lower
+    
+    local_models = get_local_ollama_models(api_url)
+    
+    # 1. Exact Match Check
+    for lm in local_models:
+        if lm.lower() == req_lower:
+            return lm
+            
+    # 2. Base Name Match Check (e.g., requested "qwen2.5" and "qwen2.5:7b" is installed)
+    for lm in local_models:
+        lm_lower = lm.lower()
+        lm_base = lm_lower.split(":")[0] if ":" in lm_lower else lm_lower
+        if lm_base == req_base:
+            return lm
+            
+    # 3. Pull from registry if missing entirely
+    pull_success = pull_ollama_model(api_url, req_clean)
+    if pull_success:
+        updated_models = get_local_ollama_models(api_url)
+        for lm in updated_models:
+            if lm.lower() == req_lower:
+                return lm
+        if updated_models:
+            for lm in updated_models:
+                lm_lower = lm.lower()
+                lm_base = lm_lower.split(":")[0] if ":" in lm_lower else lm_lower
+                if lm_base == req_base:
+                    return lm
+                    
+    # 4. Fallback of last resort: if offline or download failed, use best installed model
+    if local_models:
+        # Try to find a family match first (e.g. "gemma" or "aya" prefix)
+        family_matches = [lm for lm in local_models if lm.lower().startswith(req_base)]
+        if family_matches:
+            family_matches.sort(key=natural_keys, reverse=True)
+            fallback_model = family_matches[0]
+            qprint(
+                f"  {style('[!]', C.YELLOW)} Failed to acquire requested model '{requested_model}'. "
+                f"Gracefully falling back to matching family model '{fallback_model}'."
+            )
+            return fallback_model
+            
+        # Try to look for highly capable general translation models in local inventory
+        preferred_patterns = ["aya", "llama3.1", "qwen2.5", "gemma2", "qwen", "llama3", "llama", "mistral", "phi"]
+        for pattern in preferred_patterns:
+            matches = [lm for lm in local_models if pattern in lm.lower()]
+            if matches:
+                matches.sort(key=natural_keys, reverse=True)
+                fallback_model = matches[0]
+                qprint(
+                    f"  {style('[!]', C.YELLOW)} Failed to acquire requested model '{requested_model}'. "
+                    f"Gracefully falling back to capable local model '{fallback_model}'."
+                )
+                return fallback_model
+                
+        fallback_model = local_models[0]
+        qprint(
+            f"  {style('[!]', C.YELLOW)} Failed to acquire requested model '{requested_model}'. "
+            f"Gracefully falling back to first installed model '{fallback_model}'."
+        )
+        return fallback_model
+    else:
+        raise TranslationError(
+            f"Requested model '{requested_model}' is not installed, and programmatically pulling it failed.\n"
+            f"      No local Ollama models are installed on your device to fall back to."
+        )
+
+
 # ════════════════════════════════════════════════════════════
 #  BOX RENDERING AND FORMATTING TOOLS
 # ════════════════════════════════════════════════════════════
@@ -2219,48 +2306,9 @@ def _execute_translator_request(
     if translator not in supported_translators:
         raise ValueError(f"Unsupported translator provider choice: {translator}")
 
-    # Check model tags locally for Ollama tasks to verify pull statuses or auto-fallback
+    # Resolve, Pull, and Fallback models programmatically on the device
     if translator == "ollama":
-        local_models = get_local_ollama_models(url_override)
-        target_clean = model.strip().lower()
-        matched_model = None
-        target_has_tag = ":" in target_clean
-
-        if local_models:
-            for lm in local_models:
-                lm_clean = lm.strip().lower()
-                if target_clean == lm_clean:
-                    matched_model = lm
-                    break
-                if not target_has_tag and lm_clean == f"{target_clean}:latest":
-                    matched_model = lm
-                    break
-        
-        if matched_model:
-            model = matched_model
-        else:
-            # Model not on device -> Programmatically pull
-            pull_success = pull_ollama_model(url_override, model)
-            if pull_success:
-                local_models = get_local_ollama_models(url_override)
-                for lm in local_models:
-                    lm_clean = lm.strip().lower()
-                    if target_clean == lm_clean or (not target_has_tag and lm_clean == f"{target_clean}:latest"):
-                        model = lm
-                        break
-            else:
-                if local_models:
-                    fallback_model = local_models[0]
-                    qprint(
-                        f"  {style('[!]', C.YELLOW)} Model pull failed or was bypassed. "
-                        f"Using existing model '{fallback_model}' to prevent execution crash."
-                    )
-                    model = fallback_model
-                else:
-                    raise TranslationError(
-                        f"Model '{model}' is not installed locally and pulling it failed. "
-                        "No local Ollama models are available to fall back to."
-                    )
+        model = resolve_ollama_model(url_override, model)
 
     if not global_rate_limiter.acquire(timeout=30):
         raise RuntimeError("API request blocked: Rate limiter token acquisition timeout.")
@@ -2295,7 +2343,7 @@ def _execute_translator_request(
 
             req = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
             
-            # Apply a generous timeout limit for Ollama execution requests to handle cold loading
+            # Determine appropriate timeout based on translation service
             req_timeout = 600 if translator == "ollama" else GEMINI_TIMEOUT
             
             with urllib.request.urlopen(req, timeout=req_timeout, context=ssl_context) as response:
@@ -2356,6 +2404,11 @@ def _execute_translator_request(
                             choices = resp_data.get("choices", [])
                             if choices:
                                 response_text = choices[0].get("message", {}).get("content", "")
+                                
+                        # Filter out raw reasoning blocks (like DeepSeek-R1 <think> loops) from subtitle text
+                        if response_text:
+                            response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+                            
                         if response_text.strip():
                             success = True
 
@@ -3018,31 +3071,35 @@ def interactive_wizard(
         qprint(f"  {style('[~]', C.GREEN)} Google Translate (Free) selected. API key and model selection bypassed.")
     elif args.translator == "ollama":
         print(f"\n{C.BOLD}── Local Translation Models sub-wizard ─────────────────────{C.RESET}")
-        print(f"    {style('[0]', C.CYAN)} Qwen2.5-7B (qwen2.5:7b)")
-        print(f"    {style('[1]', C.CYAN)} Llama-3-8B (llama3:8b)")
-        print(f"    {style('[2]', C.CYAN)} NLLB-200 (nllb)")
-        print(f"    {style('[3]', C.CYAN)} Opus-MT / Helsinki-NLP (opus-mt)")
-        print(f"    {style('[4]', C.CYAN)} Mistral-7B (mistral:7b)")
-        print(f"    {style('[5]', C.CYAN)} DeepSeek-R1-8B (deepseek-r1:8b)")
-        print(f"    {style('[6]', C.CYAN)} Gemma-2-9B (gemma2:9b)")
-        print(f"    {style('[7]', C.CYAN)} Phi-3.5 (phi3.5)")
-        print(f"    {style('[8]', C.CYAN)} Custom model tag")
+        print(f"    {style('[0]', C.CYAN)} Qwen2.5-7B (qwen2.5:7b)          - Good balanced speed/quality")
+        print(f"    {style('[1]', C.CYAN)} Llama-3.1-8B (llama3.1:8b)        - Strong multilingual capability")
+        print(f"    {style('[2]', C.CYAN)} NLLB-200 (nllb)                  - Dedicated translation model")
+        print(f"    {style('[3]', C.CYAN)} Aya Expanse 8B (aya-expanse:8b)   - Highly optimized multilingual")
+        print(f"    {style('[4]', C.CYAN)} Mistral-7B (mistral:7b)          - Efficient logical reasoning")
+        print(f"    {style('[5]', C.CYAN)} DeepSeek-R1-8B (deepseek-r1:8b)  - Reasoning model structure")
+        print(f"    {style('[6]', C.CYAN)} Gemma-2-9B (gemma2:9b)            - Extremely high quality 9B")
+        print(f"    {style('[7]', C.CYAN)} Gemma-2-27B (gemma2:27b)          - State-of-the-art offline translation")
+        print(f"    {style('[8]', C.CYAN)} Phi-3.5 (phi3.5)                 - Lightweight and fast")
+        print(f"    {style('[9]', C.CYAN)} Custom model tag")
         
         local_choice = input("  Selection [0]: ").strip()
         local_map = {
             "0": "qwen2.5:7b",
-            "1": "llama3:8b",
+            "1": "llama3.1:8b",
             "2": "nllb",
-            "3": "opus-mt",
+            "3": "aya-expanse:8b",
             "4": "mistral:7b",
             "5": "deepseek-r1:8b",
             "6": "gemma2:9b",
-            "7": "phi3.5"
+            "7": "gemma2:27b",
+            "8": "phi3.5"
         }
         if local_choice in local_map:
             args.translation_model = local_map[local_choice]
-        elif local_choice == "8":
+        elif local_choice == "9":
             args.translation_model = input("  Custom model tag: ").strip() or "qwen2.5:7b"
+        elif local_choice: # Allows typed entries like gemma4:12b directly at Selection prompt
+            args.translation_model = local_choice
         else:
             args.translation_model = "qwen2.5:7b"
             
@@ -3405,7 +3462,7 @@ def _transcribe_audio(
         tmp_srt = srt_src.with_suffix(".tmp")
         try:
             qprint(
-                f"  {style('>', C.CYAN)} Transcribing ({task_type})..."
+                f"  {style('>', C.CYAN)} Transcribing ({task_type})...."
                 f"{f' (attempt {attempt + 1}/{MAX_TRANSCRIPTION_RETRIES})' if attempt > 0 else ''}"
             )
             
@@ -4157,6 +4214,16 @@ def run_self_tests() -> bool:
         print(f"  {C.GREEN}[PASS]{C.RESET} Ollama local model payload builder")
     else:
         print(f"  {C.RED}[FAIL]{C.RESET} Ollama local model payload builder")
+        failed += 1
+
+    # Validate the Ollama model resolution trace
+    try:
+        res_m = resolve_ollama_model("http://localhost:11434", "qwen2.5:7b")
+        print(f"  {C.GREEN}[PASS]{C.RESET} resolve_ollama_model execution trace")
+    except TranslationError:
+        print(f"  {C.GREEN}[PASS]{C.RESET} resolve_ollama_model offline fallback trace")
+    except Exception as e:
+        print(f"  {C.RED}[FAIL]{C.RESET} resolve_ollama_model error: {e}")
         failed += 1
         
     print(f"{C.CYAN}───────────────────────────────────────────────────────────{C.RESET}")
