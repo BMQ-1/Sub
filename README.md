@@ -1,7 +1,7 @@
 ***
 
 # 🎬 Subs-pipeline
-An intelligent, monolithic media transcription, structural translation, and muxing pipeline. This application automates the generation of synchronized, multi-language subtitles locally using `faster-whisper` and translates them via the **Google Gemini 3.5 Flash** API - **OpenAI GPT-4o-mini** API - **Anthropic Claude 4.5 haiku** API - **Google Translate v1 FREE** API.
+An intelligent, monolithic media transcription, structural translation, and muxing pipeline. This application automates the generation of synchronized, multi-language subtitles locally using `faster-whisper` and translates them via the **Google Gemini 3.5 Flash** API - **OpenAI GPT-4o-mini** API - **Anthropic Claude 4.5 haiku** API - **Google Translate v1 FREE** API - **Ollama AI Models** Locally.
 
 ***
 
